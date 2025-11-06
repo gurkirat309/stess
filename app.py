@@ -663,10 +663,10 @@ def load_live_sensors():
             data = json.load(f) or {}
         # sanitize types
         out = {}
-        if "heart_rate" in data:  out["heart_rate"]  = float(data["heart_rate"])
-        if "temperature" in data: out["temperature"] = float(data["temperature"])
+        if "heartRate" in data:  out["heartRate"]  = float(data["heart_rate"])
+        if "tempF" in data: out["tempF"] = float(data["temperature"])
         if "light" in data:       out["light"]       = int(data["light"])  # 0/1
-        if "sound_db" in data:    out["sound_db"]    = float(data["sound_db"])
+        if "sound" in data:    out["sound"]    = float(data["sound_db"])
         return out
     except Exception as e:
         logger.warning(f"load_live_sensors: {e}")
