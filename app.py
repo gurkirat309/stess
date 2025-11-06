@@ -1,4 +1,4 @@
-# merged app.py
+# app.py (merged, Mac-safe, no background camera thread)
 import os
 import tempfile
 import numpy as np
@@ -19,96 +19,13 @@ import time
 import cv2
 from tensorflow.keras.models import model_from_json
 
-# ------------------------------
-# --- Wellness additions (config)
-# ------------------------------
-# --------------------------
-# GLOBAL FACE EMOTION STORAGE
-# --------------------------
-_face_lock = threading.Lock()
-
-latest_face_emotion = {
-    "label": None,
-    "confidence": None,
-    "ts": None
-}
-
-
-face_thread = None
-
-W_AUDIO = 0.5   # emotion-derived stress weight (audio)
-W_ENV   = 0.3   # environment (sound/light/temp)
-W_PHYS  = 0.2   # physiology (heart rate)
-W_FACE  = 0.2   # face emotion contribution (kept separate; will be clipped later)
-
-EMOTION_TO_RISK_NUM = {
-    'angry': 0.90,
-    'disgust': 0.80,
-    'fearful': 0.85,
-    'fear': 0.85,       # face model uses 'fear'
-    'sad': 0.60,
-    'surprised': 0.55,
-    'surprise': 0.55,   # face label 'surprise'
-    'neutral': 0.45,
-    'happy': 0.25
-}
-
-def ambient_risk_from_json(sound_db=None, light=None, temperature=None):
-    risks = []
-    if sound_db is not None:
-        try:
-            s = float(sound_db)
-            if s < 40:   risks.append(0.2)
-            elif s < 60: risks.append(0.4)
-            elif s < 80: risks.append(0.6)
-            else:        risks.append(0.8)
-        except:
-            pass
-    if light is not None:
-        try:
-            l = int(light)
-            risks.append(0.7 if l == 0 else 0.3)
-        except:
-            pass
-    if temperature is not None:
-        try:
-            t = float(temperature)
-            if t < 20:   risks.append(0.6)
-            elif t > 30: risks.append(0.7)
-            else:        risks.append(0.4)
-        except:
-            pass
-    if not risks:
-        return 0.4
-    return float(np.mean(risks))
-
-def physiological_risk(heart_rate=None):
-    if heart_rate is None:
-        return 0.4
-    try:
-        hr = float(heart_rate)
-        if hr < 60:    return 0.3
-        elif hr < 80:  return 0.4
-        elif hr < 100: return 0.6
-        else:          return 0.8
-    except:
-        return 0.4
-
-def recommendation_from_wellness(wellness):
-    if wellness >= 70:
-        return "You’re doing great! Hydrate and maintain good posture."
-    elif wellness >= 40:
-        return "Moderate fatigue/stress. Try 2-min deep breathing or a short walk."
-    else:
-        return "High fatigue/stress detected. Please take a 5-minute break and rest."
+from flask import Flask, request, jsonify, render_template, make_response
 
 # ------------------------------
 # Logging & Flask init
 # ------------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-from flask import Flask, request, jsonify, render_template, make_response
 
 app = Flask(__name__, static_folder="static", template_folder=".")
 app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32MB max upload
@@ -124,6 +41,43 @@ UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# ------------------------------
+# Globals / config
+# ------------------------------
+# sensor file
+SENSOR_JSON_PATH = "sensor_data.json"
+
+# camera config (env override)
+CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
+FACE_MODEL_JSON = os.environ.get("FACE_MODEL_JSON", "emotiondectector.json")
+FACE_MODEL_WEIGHTS = os.environ.get("FACE_MODEL_WEIGHTS", "emotiondetector.h5")
+
+# Shared face state (kept up-to-date by capture_face_emotion or /api/facial-emotion posts)
+_face_lock = threading.Lock()
+latest_face_emotion = {"label": None, "confidence": 0.0, "ts": None}
+
+# cached face model (loaded lazily)
+_cached_face_model = None
+_cached_face_model_lock = threading.Lock()
+
+# Wellness weights and mapping
+W_AUDIO = 0.5
+W_ENV = 0.3
+W_PHYS = 0.2
+W_FACE = 0.2
+
+EMOTION_TO_RISK_NUM = {
+    'angry': 0.90,
+    'disgust': 0.80,
+    'fearful': 0.85,
+    'fear': 0.85,
+    'sad': 0.60,
+    'surprised': 0.55,
+    'surprise': 0.55,
+    'neutral': 0.45,
+    'happy': 0.25
+}
 
 # ------------------------------
 # DB init (unchanged)
@@ -185,7 +139,6 @@ except Exception as e:
         6: "surprised"
     }
 
-# EMOTION mappings, recs, etc. (same as your app)
 EMOTION_RECOMMENDATIONS = {
     'angry': ["Take deep breaths and count to 10","Go for a short walk to cool down","Listen to calming music","Practice progressive muscle relaxation","Write down what's making you angry"],
     'disgust': ["Focus on positive aspects of your environment","Practice mindfulness to center yourself","Move to a different location if possible","Engage in a pleasant sensory experience","Talk to someone about your feelings"],
@@ -207,7 +160,7 @@ EMOTION_TO_STRESS = {
 }
 
 # ------------------------------
-# Audio preprocessing and prediction (unchanged)
+# Audio processing helpers
 # ------------------------------
 def load_audio(audio_path):
     try:
@@ -321,23 +274,26 @@ def predict_emotion(audio_path, max_duration=30.0):
         raise
 
 # ------------------------------
-# Live sensors loader (JSON lines last line)
+# Live sensors loader (json-lines last line OR plain JSON)
 # ------------------------------
-SENSOR_JSON_PATH = "sensor_data.json"
-
 def load_live_sensors():
     try:
-        with open(SENSOR_JSON_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        if not lines:
+        # support either JSON-lines last line or plain JSON file
+        if not os.path.exists(SENSOR_JSON_PATH):
             return {}
-        last_line = lines[-1].strip()
-        data = json.loads(last_line)
+        with open(SENSOR_JSON_PATH, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                return {}
+            # If file contains multiple lines JSON-lines style, pick last non-empty line
+            lines = [l.strip() for l in content.splitlines() if l.strip()]
+            last = lines[-1]
+            data = json.loads(last)
         return {
-            "heart_rate": float(data.get("heartRate", 0)),
-            "temperature": float(data.get("tempF", 0)),
+            "heart_rate": float(data.get("heartRate", data.get("heart_rate", 0))),
+            "temperature": float(data.get("tempF", data.get("temperature", 0))),
             "light": int(data.get("light", 0)),
-            "sound_db": float(data.get("sound", 0))
+            "sound_db": float(data.get("sound", data.get("sound_db", 0)))
         }
     except Exception as e:
         logger.warning(f"load_live_sensors error: {e}")
@@ -348,126 +304,211 @@ def get_sensors():
     return jsonify(load_live_sensors())
 
 # ------------------------------
-# Face emotion detector (background thread)
+# Face model helpers (lazy load & capture one frame)
 # ------------------------------
-# Configure model paths (edit these to your actual paths)
-MODEL_JSON_PATH = os.environ.get("FACE_MODEL_JSON", "emotiondectector.json")
-MODEL_WEIGHTS_PATH = os.environ.get("FACE_MODEL_WEIGHTS", "emotiondetector.h5")
-CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
-
-# Shared state for latest face emotion
-latest_face_emotion = {"label": "neutral", "confidence": 0.0, "ts": None}
-_face_lock = threading.Lock()
-
 def safe_load_face_model():
-    try:
-        with open(MODEL_JSON_PATH, "r", encoding="utf-8") as jf:
-            model_json = jf.read()
-        m = model_from_json(model_json)
-        m.load_weights(MODEL_WEIGHTS_PATH)
-        logger.info("Face emotion model loaded")
-        return m
-    except Exception as e:
-        logger.warning(f"Failed to load face model: {e}")
-        return None
+    """
+    Load and cache the face model once (JSON + weights). Return None on failure.
+    """
+    global _cached_face_model
+    with _cached_face_model_lock:
+        if _cached_face_model is not None:
+            return _cached_face_model
+        try:
+            with open(FACE_MODEL_JSON, "r", encoding="utf-8") as jf:
+                model_json = jf.read()
+            m = model_from_json(model_json)
+            m.load_weights(FACE_MODEL_WEIGHTS)
+            _cached_face_model = m
+            logger.info("Face emotion model loaded (cached).")
+            return _cached_face_model
+        except Exception as e:
+            logger.warning(f"Failed to load face model: {e}")
+            _cached_face_model = None
+            return None
 
-def start_face_detection():
-    global latest_face_emotion
+def capture_face_emotion(timeout_seconds=3):
+    """
+    Open camera briefly, capture one frame, run face detection/prediction.
+    Returns dict: {label, confidence, ts} and updates latest_face_emotion under lock.
+    This function is synchronous and intended to be called on-demand (not in a persistent thread).
+    """
     face_model = safe_load_face_model()
     if face_model is None:
-        logger.warning("Face model not available: face detection will not run.")
-        return
+        return {"label": None, "confidence": 0.0, "ts": None, "error": "face model not available"}
 
-    # face labels - keep as provided in your realtime script (Option A)
-    labels = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 4: 'neutral', 5: 'sad', 6: 'surprise'}
+    # try to open camera (use CAP_DSHOW on Windows if needed)
+    try:
+        # Note: on macOS/OpenCV, sometimes CAP_DSHOW isn't available — keep default
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        start = time.time()
+        if not cap.isOpened():
+            # try fallback backends
+            try:
+                cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+            except Exception:
+                pass
 
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        # warm-up for a short time
+        warm_started = time.time()
+        while time.time() - warm_started < 0.3:
+            if cap.isOpened():
+                break
+            time.sleep(0.05)
 
-    cap = None
-    while True:
+        if not cap.isOpened():
+            return {"label": None, "confidence": 0.0, "ts": None, "error": "camera not available"}
+
+        # set a reasonable resolution
         try:
-            if cap is None or not cap.isOpened():
-                cap = cv2.VideoCapture(CAMERA_INDEX)
-                if not cap.isOpened():
-                    logger.warning("Unable to open camera, retrying in 2s")
-                    time.sleep(2)
-                    continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        except:
+            pass
 
-            ret, frame = cap.read()
+        # read one good frame within timeout
+        frame = None
+        while time.time() - start < timeout_seconds:
+            ret, f = cap.read()
             if not ret:
-                logger.warning("Failed to read frame from camera")
-                time.sleep(0.5)
+                time.sleep(0.05)
                 continue
+            frame = f
+            break
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
-
-            # If multiple faces, pick the largest
-            chosen = None
-            max_area = 0
-            for (x,y,w,h) in faces:
-                area = w*h
-                if area > max_area:
-                    max_area = area
-                    chosen = (x,y,w,h)
-
-            if chosen is not None:
-                x,y,w,h = chosen
-                face = gray[y:y+h, x:x+w]
-                try:
-                    face = cv2.resize(face, (48,48))
-                    face = face.astype("float")/255.0
-                    face = face.reshape(1,48,48,1)
-                    pred = face_model.predict(face, verbose=0)[0]
-                    idx = int(np.argmax(pred))
-                    label = labels.get(idx, "neutral")
-                    conf = float(pred[idx])
-                    with _face_lock:
-                        latest_face_emotion["label"] = label
-                        latest_face_emotion["confidence"] = round(conf, 3)
-                        latest_face_emotion["ts"] = datetime.utcnow().isoformat() + "Z"
-                except Exception as fe:
-                    logger.debug(f"Face preprocess/predict error: {fe}")
-            else:
-                # no face: optionally decay to neutral slowly
-                with _face_lock:
-                    if latest_face_emotion["ts"] is None:
-                        latest_face_emotion["ts"] = datetime.utcnow().isoformat() + "Z"
-
-            # small sleep to avoid maxing CPU
-            time.sleep(0.08)
-
-        except Exception as e:
-            logger.exception(f"Face detection thread error: {e}")
-            time.sleep(1)
-
-    if cap:
         cap.release()
 
-# start background thread (daemon)
-#face_thread = threading.Thread(target=start_face_detection, daemon=True)
-#face_thread.start()
-@app.route('/start-face', methods=['GET'])
-def start_face():
-    global face_thread
+        if frame is None:
+            return {"label": None, "confidence": 0.0, "ts": None, "error": "no frame captured"}
 
-    if face_thread is None or not face_thread.is_alive():
-        face_thread = threading.Thread(target=start_face_detection, daemon=True)
-        face_thread.start()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
 
-    return jsonify({"status": "face detection thread started"})
+        if len(faces) == 0:
+            return {"label": None, "confidence": 0.0, "ts": None, "error": "no face detected"}
 
+        # pick largest face
+        x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+        roi = gray[y:y+h, x:x+w]
+        roi = cv2.resize(roi, (48, 48))
+        roi = roi.astype("float") / 255.0
+        roi = roi.reshape(1, 48, 48, 1)
+
+        pred = face_model.predict(roi, verbose=0)[0]
+        idx = int(np.argmax(pred))
+        # map to the same labels you used in training
+        labels = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 4: 'neutral', 5: 'sad', 6: 'surprise'}
+        label = labels.get(idx, "neutral")
+        conf = float(pred[idx])
+
+        out = {"label": label, "confidence": round(conf, 3), "ts": datetime.utcnow().isoformat() + "Z"}
+
+        # update shared state
+        with _face_lock:
+            latest_face_emotion.update({"label": out["label"], "confidence": out["confidence"], "ts": out["ts"]})
+
+        return out
+
+    except Exception as e:
+        logger.exception(f"capture_face_emotion error: {e}")
+        try:
+            if 'cap' in locals() and cap and cap.isOpened():
+                cap.release()
+        except:
+            pass
+        return {"label": None, "confidence": 0.0, "ts": None, "error": str(e)}
+
+# ------------------------------
+# Routes for face emotion
+# ------------------------------
+@app.route('/capture-face', methods=['GET'])
+def capture_face_route():
+    """
+    Capture one frame from the camera, run face emotion detection, return result.
+    This is safe to call from UI or a client. It does not start a persistent thread.
+    """
+    result = capture_face_emotion()
+    return jsonify(result)
+
+@app.route("/api/facial-emotion", methods=["POST"])
+def facial_emotion_api():
+    """
+    Accept external real-time inputs (e.g., your OpenCV script can POST detected emotion).
+    Example JSON: {"emotion": "happy", "confidence": 0.87}
+    Storing this will also overwrite latest_face_emotion so wellness uses it.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        emotion = data.get("emotion") or data.get("label")
+        confidence = data.get("confidence", None)
+        if not emotion:
+            return jsonify({"error": "No emotion provided"}), 400
+        ts = datetime.utcnow().isoformat() + "Z"
+        with _face_lock:
+            latest_face_emotion.update({
+                "label": str(emotion).lower(),
+                "confidence": float(confidence) if confidence is not None else latest_face_emotion.get("confidence", 0.0),
+                "ts": ts
+            })
+        return jsonify({"status": "ok", "label": str(emotion).lower(), "confidence": confidence, "ts": ts})
+    except Exception as e:
+        logger.exception("facial_emotion_api error")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/face-emotion', methods=['GET'])
 def face_emotion_route():
+    """
+    Return the most recent face emotion state (captured by /capture-face or /api/facial-emotion).
+    """
     with _face_lock:
         return jsonify(latest_face_emotion)
 
 # ------------------------------
-# Wellness compute that can use face emotion too
+# Wellness helpers
 # ------------------------------
+def ambient_risk_from_json(sound_db=None, light=None, temperature=None):
+    risks = []
+    if sound_db is not None:
+        try:
+            s = float(sound_db)
+            if s < 40:   risks.append(0.2)
+            elif s < 60: risks.append(0.4)
+            elif s < 80: risks.append(0.6)
+            else:        risks.append(0.8)
+        except:
+            pass
+    if light is not None:
+        try:
+            l = int(light)
+            risks.append(0.7 if l == 0 else 0.3)
+        except:
+            pass
+    if temperature is not None:
+        try:
+            t = float(temperature)
+            if t < 20:   risks.append(0.6)
+            elif t > 30: risks.append(0.7)
+            else:        risks.append(0.4)
+        except:
+            pass
+    if not risks:
+        return 0.4
+    return float(np.mean(risks))
+
+def physiological_risk(heart_rate=None):
+    if heart_rate is None:
+        return 0.4
+    try:
+        hr = float(heart_rate)
+        if hr < 60:    return 0.3
+        elif hr < 80:  return 0.4
+        elif hr < 100: return 0.6
+        else:          return 0.8
+    except:
+        return 0.4
+
 def face_emotion_risk(face_label):
-    # Option A: use raw face labels as-is (user chose A)
     if not face_label:
         return 0.45
     key = str(face_label).lower()
@@ -478,8 +519,16 @@ def compute_wellness_index_from_components(audio_risk, env_risk, phys_risk, face
     wellness_index = int(round(100 * (1.0 - total)))
     return wellness_index, total
 
+def recommendation_from_wellness(wellness):
+    if wellness >= 70:
+        return "You’re doing great! Hydrate and maintain good posture."
+    elif wellness >= 40:
+        return "Moderate fatigue/stress. Try 2-min deep breathing or a short walk."
+    else:
+        return "High fatigue/stress detected. Please take a 5-minute break and rest."
+
 # ------------------------------
-# analyze route (unchanged logic but now reads face emotion for final response)
+# User & DB helpers (unchanged)
 # ------------------------------
 def get_user_id_from_request(request):
     user_id = request.cookies.get('user_id')
@@ -513,6 +562,9 @@ def save_emotion_record(user_id, emotion_data):
         logger.error(f"Error saving emotion record: {e}")
         return None
 
+# ------------------------------
+# Routes: index, analyze
+# ------------------------------
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -722,148 +774,8 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'model_loaded': model is not None,
-        'face_model_available': os.path.exists(MODEL_JSON_PATH) and os.path.exists(MODEL_WEIGHTS_PATH)
+        'face_model_available': os.path.exists(FACE_MODEL_JSON) and os.path.exists(FACE_MODEL_WEIGHTS)
     })
-@app.route("/api/facial-emotion", methods=["POST"])
-def facial_emotion():
-    """
-    Receives real-time facial emotion from your OpenCV model.
-    (Example payload: {"emotion": "happy"})
-    """
-    try:
-        data = request.get_json(silent=True) or {}
-        emotion = data.get("emotion")
-
-        if not emotion:
-            return jsonify({"error": "No emotion received"}), 400
-
-        # ✅ Store latest facial emotion globally
-        app.config["FACIAL_EMOTION"] = emotion
-
-        return jsonify({"status": "ok", "emotion": emotion})
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
-@app.route("/facial-emotion", methods=["GET"])
-def get_facial_emotion():
-    return jsonify({"emotion": app.config.get("FACIAL_EMOTION", "neutral")})
-
-# ------------------ FACE EMOTION BACKGROUND THREAD ------------------
-
-latest_face_emotion = {
-    "label": None,
-    "confidence": None,
-    "ts": None
-}
-_face_lock = threading.Lock()
-CAMERA_INDEX = 0   # change if needed
-
-
-def safe_load_face_model():
-    """Load your FER model safely."""
-    try:
-        return load_model("face_emotion_model.h5")
-    except Exception as e:
-        logger.error(f"Failed to load face model: {e}")
-        return None
-
-
-def start_face_detection():
-    global latest_face_emotion
-
-    face_model = safe_load_face_model()
-    if face_model is None:
-        logger.warning("Face model not available → skipping face detection thread")
-        return
-
-    labels = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy',
-              4: 'neutral', 5: 'sad', 6: 'surprise'}
-
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    )
-
-    cap = None
-
-    while True:
-        try:
-            # ✅ ensure the camera is open
-            if cap is None or not cap.isOpened():
-                cap = cv2.VideoCapture(CAMERA_INDEX)
-                if not cap.isOpened():
-                    logger.warning("Camera not available. Retrying in 2s...")
-                    time.sleep(2)
-                    continue
-
-            ret, frame = cap.read()
-            if not ret:
-                logger.warning("Could not read frame. Retrying...")
-                time.sleep(0.3)
-                continue
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray, scaleFactor=1.3, minNeighbors=5
-            )
-
-            # ✅ pick largest face only (prevents multi-face confusion)
-            chosen = None
-            max_area = 0
-            for (x, y, w, h) in faces:
-                a = w * h
-                if a > max_area:
-                    max_area = a
-                    chosen = (x, y, w, h)
-
-            if chosen is not None:
-                x, y, w, h = chosen
-                face = gray[y:y + h, x:x + w]
-
-                try:
-                    face = cv2.resize(face, (48, 48))
-                    face = face.astype("float") / 255.0
-                    face = face.reshape(1, 48, 48, 1)
-
-                    pred = face_model.predict(face, verbose=0)[0]
-                    idx = int(np.argmax(pred))
-                    label = labels.get(idx, "neutral")
-                    conf = float(pred[idx])
-
-                    # ✅ Update global shared state
-                    with _face_lock:
-                        latest_face_emotion["label"] = label
-                        latest_face_emotion["confidence"] = round(conf, 3)
-                        latest_face_emotion["ts"] = datetime.utcnow().isoformat() + "Z"
-
-                except Exception as fe:
-                    logger.debug(f"Face preprocess/predict error: {fe}")
-
-            # ✅ CPU protection
-            time.sleep(0.07)
-
-        except Exception as e:
-            logger.exception(f"Face detection thread crashed: {e}")
-            time.sleep(1)
-
-    if cap:
-        cap.release()
-
-
-# ✅ Start face detection automatically
-face_thread = threading.Thread(target=start_face_detection, daemon=True)
-face_thread.start()
-
-
-# ------------------ API ENDPOINT ------------------
-@app.route('/face-emotion', methods=['GET'])
-def get_face_emotion():
-    """Return latest face emotion (label + confidence + timestamp)."""
-    with _face_lock:
-        return jsonify(latest_face_emotion)
-
-    
-
 
 # ------------------------------
 # Run server
