@@ -34,6 +34,7 @@ latest_face_emotion = {
 }
 
 
+face_thread = None
 
 W_AUDIO = 0.5   # emotion-derived stress weight (audio)
 W_ENV   = 0.3   # environment (sound/light/temp)
@@ -444,8 +445,18 @@ def start_face_detection():
         cap.release()
 
 # start background thread (daemon)
-face_thread = threading.Thread(target=start_face_detection, daemon=True)
-face_thread.start()
+#face_thread = threading.Thread(target=start_face_detection, daemon=True)
+#face_thread.start()
+@app.route('/start-face', methods=['GET'])
+def start_face():
+    global face_thread
+
+    if face_thread is None or not face_thread.is_alive():
+        face_thread = threading.Thread(target=start_face_detection, daemon=True)
+        face_thread.start()
+
+    return jsonify({"status": "face detection thread started"})
+
 
 @app.route('/face-emotion', methods=['GET'])
 def face_emotion_route():
