@@ -687,6 +687,22 @@
                  <div>Temperature: <strong id="sensor-temp">–</strong> °C</div>
                  <div>Light: <strong id="sensor-light">–</strong></div>
                  <div>Sound: <strong id="sensor-sound">–</strong> dB</div>
+                 <div id="face-emotion-box" style="
+    margin-top: 20px;
+    padding: 15px;
+    border: 1px solid #444;
+    border-radius: 8px;
+    background: #222;
+    color: white;
+">
+    <h3>Facial Emotion</h3>
+    <p><strong>Emotion:</strong> <span id="face-emotion-label">Loading...</span></p>
+    <p><strong>Confidence:</strong> <span id="face-emotion-confidence">--</span></p>
+    <p><strong>Timestamp:</strong> <span id="face-emotion-ts">--</span></p>
+</div>
+
+                 
+
                </div>
             </div>
                 
@@ -955,6 +971,20 @@
     <script>
         // cache latest sensors so analyzeRecording/analyzeFile can use them
 let cachedSensors = null;
+function fetchFaceEmotion() {
+    fetch('/face-emotion')
+        .then(response => response.json())
+        .then(data => {
+            document.getElementById("face-emotion-label").textContent = data.label || "No Face";
+            document.getElementById("face-emotion-confidence").textContent = data.confidence || "--";
+            document.getElementById("face-emotion-ts").textContent = data.ts || "--";
+        })
+        .catch(err => console.error("Face emotion fetch error:", err));
+}
+
+// Update face emotion every 1 second
+setInterval(fetchFaceEmotion, 1000);
+
 
 async function fetchSensors() {
   try {

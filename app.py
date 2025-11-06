@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template, make_response
+# merged app.py
 import os
 import tempfile
 import numpy as np
@@ -12,33 +12,48 @@ import traceback
 import sqlite3
 from datetime import datetime, timedelta
 import json
+import threading
+import time
+
+# OpenCV / Keras imports for face model
+import cv2
+from tensorflow.keras.models import model_from_json
 
 # ------------------------------
 # --- Wellness additions (config)
 # ------------------------------
-# Combine risks (tweak later if needed)
-W_AUDIO = 0.5   # emotion-derived stress weight
+# --------------------------
+# GLOBAL FACE EMOTION STORAGE
+# --------------------------
+_face_lock = threading.Lock()
+
+latest_face_emotion = {
+    "label": None,
+    "confidence": None,
+    "ts": None
+}
+
+
+
+W_AUDIO = 0.5   # emotion-derived stress weight (audio)
 W_ENV   = 0.3   # environment (sound/light/temp)
 W_PHYS  = 0.2   # physiology (heart rate)
+W_FACE  = 0.2   # face emotion contribution (kept separate; will be clipped later)
 
-# Map emotion -> base stress risk [0..1]
 EMOTION_TO_RISK_NUM = {
     'angry': 0.90,
     'disgust': 0.80,
     'fearful': 0.85,
+    'fear': 0.85,       # face model uses 'fear'
     'sad': 0.60,
     'surprised': 0.55,
+    'surprise': 0.55,   # face label 'surprise'
     'neutral': 0.45,
-    'happy': 0.25,
-    # 'calm': 0.15,  # only if present in your labels
+    'happy': 0.25
 }
 
 def ambient_risk_from_json(sound_db=None, light=None, temperature=None):
-    """Heuristic env risk (0..1) from provided sensors.
-       light: 0=dark, 1=light
-    """
     risks = []
-    # Sound (dB)
     if sound_db is not None:
         try:
             s = float(sound_db)
@@ -46,16 +61,14 @@ def ambient_risk_from_json(sound_db=None, light=None, temperature=None):
             elif s < 60: risks.append(0.4)
             elif s < 80: risks.append(0.6)
             else:        risks.append(0.8)
-        except:  # ignore parse errors
+        except:
             pass
-    # Light (binary)
     if light is not None:
         try:
             l = int(light)
             risks.append(0.7 if l == 0 else 0.3)
         except:
             pass
-    # Temperature (°C)
     if temperature is not None:
         try:
             t = float(temperature)
@@ -64,13 +77,11 @@ def ambient_risk_from_json(sound_db=None, light=None, temperature=None):
             else:        risks.append(0.4)
         except:
             pass
-
     if not risks:
         return 0.4
     return float(np.mean(risks))
 
 def physiological_risk(heart_rate=None):
-    """HR -> stress risk (0..1). Simple bins you can refine later."""
     if heart_rate is None:
         return 0.4
     try:
@@ -90,15 +101,17 @@ def recommendation_from_wellness(wellness):
     else:
         return "High fatigue/stress detected. Please take a 5-minute break and rest."
 
-# Configure logging
+# ------------------------------
+# Logging & Flask init
+# ------------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
+from flask import Flask, request, jsonify, render_template, make_response
+
 app = Flask(__name__, static_folder="static", template_folder=".")
 app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32MB max upload
 
-# Add CORS headers to support different clients
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -106,18 +119,17 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
 
-# Configure upload folder
 UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# Initialize database
+# ------------------------------
+# DB init (unchanged)
+# ------------------------------
 def init_db():
     conn = sqlite3.connect('emotion_analyzer.db')
     cursor = conn.cursor()
-    
-    # Create users table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,8 +140,6 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
-    
-    # Create emotion_records table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS emotion_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,24 +153,25 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users (id)
     )
     ''')
-    
     conn.commit()
     conn.close()
     logger.info("Database initialized")
 
 init_db()
 
-# Load the model and feature extractor
-print("Loading model...")
+# ------------------------------
+# Audio model loading (unchanged)
+# ------------------------------
+print("Loading audio model...")
 try:
     model_id = "firdhokk/speech-emotion-recognition-with-openai-whisper-large-v3"
     model = AutoModelForAudioClassification.from_pretrained(model_id)
     feature_extractor = AutoFeatureExtractor.from_pretrained(model_id, do_normalize=True)
     id2label = model.config.id2label
-    print("Model loaded successfully")
+    print("Audio model loaded successfully")
 except Exception as e:
-    print(f"Error loading model: {e}")
-    print("Using fallback mode")
+    print(f"Error loading audio model: {e}")
+    print("Using fallback audio mode")
     model = None
     feature_extractor = None
     id2label = {
@@ -173,60 +184,17 @@ except Exception as e:
         6: "surprised"
     }
 
-# Define emotion to recommendations mapping
+# EMOTION mappings, recs, etc. (same as your app)
 EMOTION_RECOMMENDATIONS = {
-    'angry': [
-        "Take deep breaths and count to 10",
-        "Go for a short walk to cool down",
-        "Listen to calming music",
-        "Practice progressive muscle relaxation",
-        "Write down what's making you angry"
-    ],
-    'disgust': [
-        "Focus on positive aspects of your environment",
-        "Practice mindfulness to center yourself",
-        "Move to a different location if possible",
-        "Engage in a pleasant sensory experience",
-        "Talk to someone about your feelings"
-    ],
-    'fearful': [
-        "Use grounding techniques (name 5 things you can see, 4 things you can touch, etc.)",
-        "Remember that feelings pass with time",
-        "Practice deep breathing exercises",
-        "Challenge irrational thoughts",
-        "Reach out to a supportive friend"
-    ],
-    'happy': [
-        "Savor this positive emotion fully",
-        "Share your happiness with others",
-        "Express gratitude for what's going well",
-        "Engage in activities you enjoy",
-        "Document this moment to revisit later"
-    ],
-    'neutral': [
-        "Reflect on your current goals and priorities",
-        "Use this balanced state for decision-making",
-        "Practice gratitude for your emotional balance",
-        "Set intentions for the rest of your day",
-        "Check in with your physical needs (hunger, thirst, rest)"
-    ],
-    'sad': [
-        "Allow yourself to feel without judgment",
-        "Engage in gentle physical activity",
-        "Connect with a friend or family member",
-        "Practice self-compassion",
-        "Do something creative or expressive"
-    ],
-    'surprised': [
-        "Take a moment to process the unexpected event",
-        "Focus on your breathing to center yourself",
-        "Assess whether any action is needed",
-        "Share your experience with someone",
-        "Use the energy of surprise for creativity"
-    ]
+    'angry': ["Take deep breaths and count to 10","Go for a short walk to cool down","Listen to calming music","Practice progressive muscle relaxation","Write down what's making you angry"],
+    'disgust': ["Focus on positive aspects of your environment","Practice mindfulness to center yourself","Move to a different location if possible","Engage in a pleasant sensory experience","Talk to someone about your feelings"],
+    'fearful': ["Use grounding techniques (name 5 things you can see, 4 things you can touch, etc.)","Remember that feelings pass with time","Practice deep breathing exercises","Challenge irrational thoughts","Reach out to a supportive friend"],
+    'happy': ["Savor this positive emotion fully","Share your happiness with others","Express gratitude for what's going well","Engage in activities you enjoy","Document this moment to revisit later"],
+    'neutral': ["Reflect on your current goals and priorities","Use this balanced state for decision-making","Practice gratitude for your emotional balance","Set intentions for the rest of your day","Check in with your physical needs (hunger, thirst, rest)"],
+    'sad': ["Allow yourself to feel without judgment","Engage in gentle physical activity","Connect with a friend or family member","Practice self-compassion","Do something creative or expressive"],
+    'surprised': ["Take a moment to process the unexpected event","Focus on your breathing to center yourself","Assess whether any action is needed","Share your experience with someone","Use the energy of surprise for creativity"]
 }
 
-# Define emotion to stress level mapping
 EMOTION_TO_STRESS = {
     'angry': 'high',
     'disgust': 'high',
@@ -237,23 +205,21 @@ EMOTION_TO_STRESS = {
     'happy': 'low'
 }
 
+# ------------------------------
+# Audio preprocessing and prediction (unchanged)
+# ------------------------------
 def load_audio(audio_path):
-    """Load audio file with multiple fallback methods"""
     try:
-        # Primary method: librosa
         audio_array, sampling_rate = librosa.load(audio_path, sr=16000)
         logger.info(f"Loaded audio with librosa: length={len(audio_array)}, sr={sampling_rate}")
         return audio_array, sampling_rate
     except Exception as e:
         logger.warning(f"Librosa failed to load audio: {e}")
         try:
-            # Try with soundfile
             import soundfile as sf
             audio_array, sampling_rate = sf.read(audio_path)
-            # Convert to mono if stereo
             if len(audio_array.shape) > 1 and audio_array.shape[1] > 1:
                 audio_array = np.mean(audio_array, axis=1)
-            # Resample to 16kHz if needed
             if sampling_rate != 16000:
                 audio_array = librosa.resample(audio_array, orig_sr=sampling_rate, target_sr=16000)
                 sampling_rate = 16000
@@ -261,7 +227,6 @@ def load_audio(audio_path):
             return audio_array, sampling_rate
         except Exception as sf_e:
             logger.warning(f"SoundFile failed to load audio: {sf_e}")
-            # Last resort: wave module
             try:
                 import wave
                 with wave.open(audio_path, 'rb') as wf:
@@ -270,24 +235,17 @@ def load_audio(audio_path):
                     sample_width = wf.getsampwidth()
                     channels = wf.getnchannels()
                     raw_data = wf.readframes(frames)
-                    
-                    # Convert to float32 normalized array
                     if sample_width == 2:
                         data = np.frombuffer(raw_data, dtype=np.int16)
                         audio_array = data.astype(np.float32) / 32768.0
                     else:
                         data = np.frombuffer(raw_data, dtype=np.int8)
                         audio_array = data.astype(np.float32) / 128.0
-                    
-                    # Convert to mono if stereo
                     if channels > 1:
                         audio_array = audio_array.reshape(-1, channels).mean(axis=1)
-                    
-                    # Resample if needed
                     if sample_rate != 16000:
                         audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
                         sample_rate = 16000
-                    
                     logger.info(f"Loaded audio with wave: length={len(audio_array)}, sr={sample_rate}")
                     return audio_array, sample_rate
             except Exception as wave_e:
@@ -295,56 +253,33 @@ def load_audio(audio_path):
                 raise Exception("Failed to load audio file with any available method")
 
 def preprocess_audio(audio_path, max_duration=30.0):
-    """Preprocess audio for the Whisper model"""
     try:
-        # Load audio file
         audio_array, sampling_rate = load_audio(audio_path)
-        
-        # Handle maximum duration
-        max_length = int(16000 * max_duration)  # 16kHz sample rate
+        max_length = int(16000 * max_duration)
         if len(audio_array) > max_length:
-            logger.info(f"Audio too long ({len(audio_array)} samples), truncating to {max_length} samples")
             audio_array = audio_array[:max_length]
-        
-        # Handle very short recordings
-        if len(audio_array) < 8000:  # Less than 0.5 seconds
-            logger.info(f"Audio too short ({len(audio_array)} samples), padding")
+        if len(audio_array) < 8000:
             audio_array = np.pad(audio_array, (0, 8000 - len(audio_array)), 'constant')
-        
-        # Normalize audio
         audio_array = librosa.util.normalize(audio_array)
-        
-        # Extract features
         if feature_extractor:
-            inputs = feature_extractor(
-                audio_array,
-                sampling_rate=16000,
-                return_tensors="pt"
-            )
+            inputs = feature_extractor(audio_array, sampling_rate=16000, return_tensors="pt")
             return inputs, audio_array
         else:
-            # Fallback for testing when model isn't loaded
             return None, audio_array
-            
     except Exception as e:
         logger.error(f"Error preprocessing audio: {e}")
         traceback.print_exc()
         raise
 
 def predict_emotion(audio_path, max_duration=30.0):
-    """Predict emotion from audio file"""
     try:
-        # Fallback mode if model not loaded
         if model is None:
-            # Generate random probabilities for testing
             emotions = list(id2label.values())
             probs = {emotion: random.uniform(0.01, 0.2) for emotion in emotions}
             emotion = random.choice(emotions)
-            probs[emotion] = random.uniform(0.6, 0.9)  # Give the "detected" emotion a high probability
+            probs[emotion] = random.uniform(0.6, 0.9)
             stress_level = EMOTION_TO_STRESS.get(emotion, 'medium')
             recommendation = random.choice(EMOTION_RECOMMENDATIONS.get(emotion, EMOTION_RECOMMENDATIONS['neutral']))
-            
-            logger.info(f"Using fallback mode. Selected emotion: {emotion}")
             return {
                 'emotion': emotion,
                 'confidence': probs[emotion],
@@ -355,16 +290,10 @@ def predict_emotion(audio_path, max_duration=30.0):
                 'audio_duration': 5.0,
                 'note': 'Using fallback mode (model not loaded)'
             }
-        
-        # Preprocess audio
         inputs, audio_array = preprocess_audio(audio_path, max_duration)
-        
-        # Setup device (CPU/GPU)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
         inputs = {key: value.to(device) for key, value in inputs.items()}
-        
-        # Make prediction
         with torch.no_grad():
             outputs = model(**inputs)
             logits = outputs.logits
@@ -372,19 +301,10 @@ def predict_emotion(audio_path, max_duration=30.0):
             predicted_id = torch.argmax(logits, dim=-1).item()
             predicted_label = id2label[predicted_id]
             confidence = probabilities[0][predicted_id].item()
-            
-            # Get all probabilities
             all_probs = {id2label[i]: prob.item() for i, prob in enumerate(probabilities[0])}
-            
-        # Map to stress level
         stress_level = EMOTION_TO_STRESS.get(predicted_label, 'medium')
-        
-        # Get recommendation
         recommendations = EMOTION_RECOMMENDATIONS.get(predicted_label, EMOTION_RECOMMENDATIONS['neutral'])
         recommendation = random.choice(recommendations)
-        
-        logger.info(f"Prediction complete. Emotion: {predicted_label}, Confidence: {confidence:.2%}")
-        
         return {
             'emotion': predicted_label,
             'confidence': confidence,
@@ -399,23 +319,169 @@ def predict_emotion(audio_path, max_duration=30.0):
         traceback.print_exc()
         raise
 
+# ------------------------------
+# Live sensors loader (JSON lines last line)
+# ------------------------------
+SENSOR_JSON_PATH = "sensor_data.json"
+
+def load_live_sensors():
+    try:
+        with open(SENSOR_JSON_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if not lines:
+            return {}
+        last_line = lines[-1].strip()
+        data = json.loads(last_line)
+        return {
+            "heart_rate": float(data.get("heartRate", 0)),
+            "temperature": float(data.get("tempF", 0)),
+            "light": int(data.get("light", 0)),
+            "sound_db": float(data.get("sound", 0))
+        }
+    except Exception as e:
+        logger.warning(f"load_live_sensors error: {e}")
+        return {}
+
+@app.route('/sensors', methods=['GET'])
+def get_sensors():
+    return jsonify(load_live_sensors())
+
+# ------------------------------
+# Face emotion detector (background thread)
+# ------------------------------
+# Configure model paths (edit these to your actual paths)
+MODEL_JSON_PATH = os.environ.get("FACE_MODEL_JSON", "emotiondectector.json")
+MODEL_WEIGHTS_PATH = os.environ.get("FACE_MODEL_WEIGHTS", "emotiondetector.h5")
+CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
+
+# Shared state for latest face emotion
+latest_face_emotion = {"label": "neutral", "confidence": 0.0, "ts": None}
+_face_lock = threading.Lock()
+
+def safe_load_face_model():
+    try:
+        with open(MODEL_JSON_PATH, "r", encoding="utf-8") as jf:
+            model_json = jf.read()
+        m = model_from_json(model_json)
+        m.load_weights(MODEL_WEIGHTS_PATH)
+        logger.info("Face emotion model loaded")
+        return m
+    except Exception as e:
+        logger.warning(f"Failed to load face model: {e}")
+        return None
+
+def start_face_detection():
+    global latest_face_emotion
+    face_model = safe_load_face_model()
+    if face_model is None:
+        logger.warning("Face model not available: face detection will not run.")
+        return
+
+    # face labels - keep as provided in your realtime script (Option A)
+    labels = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 4: 'neutral', 5: 'sad', 6: 'surprise'}
+
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    cap = None
+    while True:
+        try:
+            if cap is None or not cap.isOpened():
+                cap = cv2.VideoCapture(CAMERA_INDEX)
+                if not cap.isOpened():
+                    logger.warning("Unable to open camera, retrying in 2s")
+                    time.sleep(2)
+                    continue
+
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("Failed to read frame from camera")
+                time.sleep(0.5)
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+
+            # If multiple faces, pick the largest
+            chosen = None
+            max_area = 0
+            for (x,y,w,h) in faces:
+                area = w*h
+                if area > max_area:
+                    max_area = area
+                    chosen = (x,y,w,h)
+
+            if chosen is not None:
+                x,y,w,h = chosen
+                face = gray[y:y+h, x:x+w]
+                try:
+                    face = cv2.resize(face, (48,48))
+                    face = face.astype("float")/255.0
+                    face = face.reshape(1,48,48,1)
+                    pred = face_model.predict(face, verbose=0)[0]
+                    idx = int(np.argmax(pred))
+                    label = labels.get(idx, "neutral")
+                    conf = float(pred[idx])
+                    with _face_lock:
+                        latest_face_emotion["label"] = label
+                        latest_face_emotion["confidence"] = round(conf, 3)
+                        latest_face_emotion["ts"] = datetime.utcnow().isoformat() + "Z"
+                except Exception as fe:
+                    logger.debug(f"Face preprocess/predict error: {fe}")
+            else:
+                # no face: optionally decay to neutral slowly
+                with _face_lock:
+                    if latest_face_emotion["ts"] is None:
+                        latest_face_emotion["ts"] = datetime.utcnow().isoformat() + "Z"
+
+            # small sleep to avoid maxing CPU
+            time.sleep(0.08)
+
+        except Exception as e:
+            logger.exception(f"Face detection thread error: {e}")
+            time.sleep(1)
+
+    if cap:
+        cap.release()
+
+# start background thread (daemon)
+face_thread = threading.Thread(target=start_face_detection, daemon=True)
+face_thread.start()
+
+@app.route('/face-emotion', methods=['GET'])
+def face_emotion_route():
+    with _face_lock:
+        return jsonify(latest_face_emotion)
+
+# ------------------------------
+# Wellness compute that can use face emotion too
+# ------------------------------
+def face_emotion_risk(face_label):
+    # Option A: use raw face labels as-is (user chose A)
+    if not face_label:
+        return 0.45
+    key = str(face_label).lower()
+    return EMOTION_TO_RISK_NUM.get(key, 0.5)
+
+def compute_wellness_index_from_components(audio_risk, env_risk, phys_risk, face_risk):
+    total = float(np.clip(W_AUDIO*audio_risk + W_ENV*env_risk + W_PHYS*phys_risk + W_FACE*face_risk, 0.0, 1.0))
+    wellness_index = int(round(100 * (1.0 - total)))
+    return wellness_index, total
+
+# ------------------------------
+# analyze route (unchanged logic but now reads face emotion for final response)
+# ------------------------------
 def get_user_id_from_request(request):
-    """Extract user ID from cookies"""
     user_id = request.cookies.get('user_id')
     if user_id and user_id.isdigit():
         return int(user_id)
     return None
 
 def save_emotion_record(user_id, emotion_data):
-    """Save emotion analysis record to database"""
     if not user_id:
-        logger.info("No user ID provided, skipping record save")
-        return
-    
+        return None
     try:
         conn = sqlite3.connect('emotion_analyzer.db')
         cursor = conn.cursor()
-        
         cursor.execute('''
         INSERT INTO emotion_records 
         (user_id, emotion, confidence, stress_level, recommendation, audio_duration)
@@ -426,14 +492,11 @@ def save_emotion_record(user_id, emotion_data):
             emotion_data['confidence'],
             emotion_data['stress_level'],
             emotion_data['recommendation'],
-            emotion_data['audio_duration']
+            emotion_data.get('audio_duration', 0.0)
         ))
-        
         record_id = cursor.lastrowid
         conn.commit()
         conn.close()
-        
-        logger.info(f"Saved emotion record {record_id} for user {user_id}")
         return record_id
     except Exception as e:
         logger.error(f"Error saving emotion record: {e}")
@@ -441,145 +504,113 @@ def save_emotion_record(user_id, emotion_data):
 
 @app.route('/')
 def index():
-    """Render the main page"""
     return render_template('index.html')
 
 @app.route('/analyze', methods=['POST', 'OPTIONS'])
 def analyze():
-    """Analyze uploaded or recorded audio"""
-    # Handle preflight requests for CORS
     if request.method == 'OPTIONS':
         return '', 204
-        
+
     temp_file_path = None
     try:
         logger.info(f"Received analyze request with content type: {request.content_type}")
-        
-        # Check if request contains an uploaded file
+
+        # Accept audio in file/base64/raw as before
         if 'audio' in request.files:
             audio_file = request.files['audio']
             if audio_file.filename == '':
                 return jsonify({'error': 'No selected file'})
-            
-            logger.info(f"Processing uploaded file: {audio_file.filename}")
-            
-            # Save to temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
                 temp_file_path = temp_file.name
                 audio_file.save(temp_file_path)
-                logger.info(f"Saved uploaded file to: {temp_file_path}")
-                
-        # Check if request contains base64 audio data (from live recording)
         elif 'audio_data' in request.form:
             audio_data = request.form['audio_data']
-            logger.info("Received base64 audio data")
-            
-            # Remove the data URL prefix if present
             if 'base64,' in audio_data:
                 audio_data = audio_data.split('base64,')[1]
-                logger.info("Extracted base64 data from data URL")
-            
-            # Decode base64 audio data
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
-                    temp_file_path = temp_file.name
-                    audio_bytes = base64.b64decode(audio_data)
-                    temp_file.write(audio_bytes)
-                    logger.info(f"Decoded base64 audio to: {temp_file_path} ({len(audio_bytes)} bytes)")
-            except Exception as e:
-                logger.error(f"Error decoding base64: {e}")
-                return jsonify({'error': f'Failed to decode audio data: {str(e)}'})
-                
-        # Handle raw binary data
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+                temp_file_path = temp_file.name
+                audio_bytes = base64.b64decode(audio_data)
+                temp_file.write(audio_bytes)
         elif request.data:
-            logger.info(f"Received raw audio data ({len(request.data)} bytes)")
             with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
                 temp_file_path = temp_file.name
                 temp_file.write(request.data)
-                logger.info(f"Saved raw audio data to: {temp_file_path}")
         else:
-            logger.error("No audio data found in request")
             return jsonify({'error': 'No audio data provided in any supported format'})
-        
-        # Check if the file exists and has content
-        if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) < 100:
-            logger.error(f"Invalid audio file: {temp_file_path}, size: {os.path.getsize(temp_file_path) if os.path.exists(temp_file_path) else 'file not found'}")
-            return jsonify({'error': 'Invalid or empty audio file'})
-        
-        # Predict emotion
-        result = predict_emotion(temp_file_path)
-        logger.info(f"Analysis complete: {result['emotion']} ({result['confidence_str']})")
 
-        # ------------------------------
-        # --- Wellness additions (compute from JSON sensors)
-        # Supported sources:
-        # 1) multipart/form-data field: sensor_json='{"heart_rate":..,"temperature":..,"light":0/1,"sound_db":..}'
-        # 2) raw JSON body (when client posts JSON along with/without audio)
-        # ------------------------------
+        if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) < 100:
+            return jsonify({'error': 'Invalid or empty audio file'})
+
+        # predict audio emotion
+        audio_result = predict_emotion(temp_file_path)
+        logger.info(f"Audio emotion: {audio_result.get('emotion')} ({audio_result.get('confidence_str')})")
+
+        # sensors parsing fallback to live file
         sensor_payload = {}
-        # (a) multipart form field
         if 'sensor_json' in request.form:
             try:
                 sensor_payload = json.loads(request.form.get('sensor_json') or "{}")
             except Exception as e:
-                logger.warning(f"Failed to parse sensor_json field: {e}")
-        # (b) raw JSON body
+                logger.warning(f"Failed to parse sensor_json: {e}")
         elif request.is_json:
             try:
                 sensor_payload = request.get_json(silent=True) or {}
             except Exception as e:
-                logger.warning(f"Failed to read JSON body: {e}")
+                logger.warning(f"Failed to parse JSON body: {e}")
         if not sensor_payload:
-            sensor_payload = load_live_sensors()        
-                
+            sensor_payload = load_live_sensors()
 
         heart_rate  = sensor_payload.get("heart_rate")
         temperature = sensor_payload.get("temperature")
-        light       = sensor_payload.get("light")       # 0 or 1
-        sound_db    = sensor_payload.get("sound_db")    # dB
+        light       = sensor_payload.get("light")
+        sound_db    = sensor_payload.get("sound_db")
 
-        # Audio (emotion) risk
-        emo_key = str(result['emotion']).lower().strip()
+        # audio risk
+        emo_key = str(audio_result['emotion']).lower().strip()
         audio_risk = EMOTION_TO_RISK_NUM.get(emo_key, 0.5)
 
-        # Environment + Physiology risks
         env_risk  = ambient_risk_from_json(sound_db, light, temperature)
         phys_risk = physiological_risk(heart_rate)
 
-        total_risk = float(np.clip(W_AUDIO*audio_risk + W_ENV*env_risk + W_PHYS*phys_risk, 0.0, 1.0))
-        wellness_index = int(round(100 * (1.0 - total_risk)))
+        # face emotion risk (use latest_face_emotion)
+        with _face_lock:
+            face_label = latest_face_emotion.get("label")
+            face_conf  = latest_face_emotion.get("confidence", 0.0)
+        face_risk = face_emotion_risk(face_label)
+
+        wellness_index, total_risk = compute_wellness_index_from_components(audio_risk, env_risk, phys_risk, face_risk)
         wellness_tip = recommendation_from_wellness(wellness_index)
 
-        # Attach to your existing response
-        result.update({
+        audio_result.update({
             "sensors": {
                 "heart_rate": heart_rate,
                 "temperature": temperature,
                 "light": light,
                 "sound_db": sound_db
             },
+            "face_emotion": {"label": face_label, "confidence": face_conf},
             "audio_risk": round(audio_risk, 3),
             "env_risk": round(env_risk, 3),
             "phys_risk": round(phys_risk, 3),
+            "face_risk": round(face_risk, 3),
             "risk": round(total_risk, 3),
             "wellness_index": wellness_index,
             "wellness_recommendation": wellness_tip
         })
-        # --- End wellness additions ---
-        
-        # Save record if user is logged in (unchanged)
+
+        # save record if logged in
         user_id = get_user_id_from_request(request)
         if user_id:
-            record_id = save_emotion_record(user_id, result)
-            result['record_id'] = record_id
-        
-        return jsonify(result)
-    
+            record_id = save_emotion_record(user_id, audio_result)
+            audio_result['record_id'] = record_id
+
+        return jsonify(audio_result)
+
     except Exception as e:
         logger.error(f"Error analyzing audio: {e}")
         traceback.print_exc()
-        
-        # Try fallback mode for any errors
+
+        # fallback logic similar to your existing fallback (preserve wellness computation)
         try:
             emotions = list(id2label.values())
             emotion = random.choice(emotions)
@@ -588,10 +619,8 @@ def analyze():
             recommendation = random.choice(EMOTION_RECOMMENDATIONS.get(emotion, EMOTION_RECOMMENDATIONS['neutral']))
             all_probs = {e: random.uniform(0.01, 0.2) for e in emotions}
             all_probs[emotion] = confidence
-            
-            logger.info(f"Using emergency fallback due to error. Emotion: {emotion}")
-            
-            # --- Wellness additions even in fallback (safeguard) ---
+
+            # sensors fallback
             sensor_payload = {}
             if 'sensor_json' in request.form:
                 try:
@@ -600,6 +629,8 @@ def analyze():
                     sensor_payload = {}
             elif request.is_json:
                 sensor_payload = request.get_json(silent=True) or {}
+            if not sensor_payload:
+                sensor_payload = load_live_sensors()
 
             heart_rate  = sensor_payload.get("heart_rate")
             temperature = sensor_payload.get("temperature")
@@ -609,10 +640,12 @@ def analyze():
             audio_risk = EMOTION_TO_RISK_NUM.get(emotion.lower(), 0.5)
             env_risk  = ambient_risk_from_json(sound_db, light, temperature)
             phys_risk = physiological_risk(heart_rate)
-            total_risk = float(np.clip(W_AUDIO*audio_risk + W_ENV*env_risk + W_PHYS*phys_risk, 0.0, 1.0))
-            wellness_index = int(round(100 * (1.0 - total_risk)))
+            with _face_lock:
+                face_label = latest_face_emotion.get("label")
+                face_conf  = latest_face_emotion.get("confidence", 0.0)
+            face_risk = face_emotion_risk(face_label)
+            wellness_index, total_risk = compute_wellness_index_from_components(audio_risk, env_risk, phys_risk, face_risk)
             wellness_tip = recommendation_from_wellness(wellness_index)
-            # --- end wellness additions ---
 
             return jsonify({
                 'emotion': emotion,
@@ -623,121 +656,207 @@ def analyze():
                 'all_probabilities': all_probs,
                 'audio_duration': 5.0,
                 'note': 'Using emergency fallback mode due to error',
-                # wellness extras
                 "sensors": {
                     "heart_rate": heart_rate,
                     "temperature": temperature,
                     "light": light,
                     "sound_db": sound_db
                 },
+                "face_emotion": {"label": face_label, "confidence": face_conf},
                 "audio_risk": round(audio_risk, 3),
                 "env_risk": round(env_risk, 3),
                 "phys_risk": round(phys_risk, 3),
+                "face_risk": round(face_risk, 3),
                 "risk": round(total_risk, 3),
                 "wellness_index": wellness_index,
                 "wellness_recommendation": wellness_tip
             })
-        except:
-            # If even the fallback fails, return error
+        except Exception as err:
+            logger.error(f"Emergency fallback failed: {err}")
             return jsonify({'error': str(e)})
-    
     finally:
-        # Clean up temporary file
         if temp_file_path and os.path.exists(temp_file_path):
             try:
                 os.remove(temp_file_path)
-                logger.info(f"Cleaned up temporary file: {temp_file_path}")
-            except Exception as cleanup_e:
-                logger.error(f"Error cleaning up temporary file: {cleanup_e}")
-# --- Live sensors from JSON file ---
-SENSOR_JSON_PATH = "sensor_data.json"
+            except:
+                pass
 
-SENSOR_JSON_PATH = "sensor_data.json"
-
-def load_live_sensors():
-    """
-    Reads the LAST line from a JSON-lines file.
-    Example line: {"heartRate": 78, "tempF": 84.0, "light": 1, "sound": 0}
-    """
-    try:
-        with open(SENSOR_JSON_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        if not lines:
-            return {}
-
-        last_line = lines[-1].strip()
-        data = json.loads(last_line)
-
-        return {
-            "heart_rate": float(data.get("heartRate", 0)),
-            "temperature": float(data.get("tempF", 0)),
-            "light": int(data.get("light", 0)),
-            "sound_db": float(data.get("sound", 0))
-        }
-
-    except Exception as e:
-        logger.warning(f"load_live_sensors error: {e}")
-        return {}
-
-    
-@app.route('/sensors', methods=['GET'])
-def get_sensors():
-    return jsonify(load_live_sensors())
-
-
-def compute_wellness_index(sensor):
-    """
-    Compute a 0–100 wellness score based on hardware sensor inputs.
-    Formula is simple & adjustable.
-    """
-
-    heart = sensor.get("heartRate", 0)
-    temp = sensor.get("tempF", 0)
-    light = sensor.get("light", 0)
-    sound = sensor.get("sound", 0)
-
-    score = 100
-
-    # ----- HEART RATE -----
-    if heart > 100:
-        score -= min(30, (heart - 100) * 0.5)
-    elif heart < 50:
-        score -= min(30, (50 - heart) * 0.5)
-
-    # ----- TEMPERATURE -----
-    if temp > 38:
-        score -= min(20, (temp - 38) * 5)
-    elif temp < 35:
-        score -= min(20, (35 - temp) * 5)
-
-    # ----- LIGHT -----
-    if light == 0:
-        score -= 5  # dark environment → mild fatigue
-
-    # ----- SOUND -----
-    if sound > 70:
-        score -= min(20, (sound - 70) * 0.2)
-
-    # Clamp 0–100
-    score = max(0, min(100, score))
-    return round(score, 2)
-
+# ------------------------------
+# Simple wellness endpoint using live sensors + face emotion
+# ------------------------------
 @app.route('/wellness', methods=['GET'])
 def get_wellness():
     sensor = load_live_sensors()
-    wellness = compute_wellness_index(sensor)
-
+    with _face_lock:
+        face_label = latest_face_emotion.get("label")
+        face_conf  = latest_face_emotion.get("confidence", 0.0)
+    # Use a default audio_risk of 0.5 here (audio not included)
+    audio_risk = 0.5
+    env_risk = ambient_risk_from_json(sensor.get("sound_db"), sensor.get("light"), sensor.get("temperature"))
+    phys_risk = physiological_risk(sensor.get("heart_rate"))
+    face_risk = face_emotion_risk(face_label)
+    wellness_index, total_risk = compute_wellness_index_from_components(audio_risk, env_risk, phys_risk, face_risk)
     return jsonify({
         "sensors": sensor,
-        "wellness_index": wellness
+        "face_emotion": {"label": face_label, "confidence": face_conf},
+        "wellness_index": wellness_index,
+        "risk": round(total_risk, 3)
     })
 
+# ------------------------------
+# Health check
+# ------------------------------
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'ok',
+        'model_loaded': model is not None,
+        'face_model_available': os.path.exists(MODEL_JSON_PATH) and os.path.exists(MODEL_WEIGHTS_PATH)
+    })
+@app.route("/api/facial-emotion", methods=["POST"])
+def facial_emotion():
+    """
+    Receives real-time facial emotion from your OpenCV model.
+    (Example payload: {"emotion": "happy"})
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        emotion = data.get("emotion")
+
+        if not emotion:
+            return jsonify({"error": "No emotion received"}), 400
+
+        # ✅ Store latest facial emotion globally
+        app.config["FACIAL_EMOTION"] = emotion
+
+        return jsonify({"status": "ok", "emotion": emotion})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route("/facial-emotion", methods=["GET"])
+def get_facial_emotion():
+    return jsonify({"emotion": app.config.get("FACIAL_EMOTION", "neutral")})
+
+# ------------------ FACE EMOTION BACKGROUND THREAD ------------------
+
+latest_face_emotion = {
+    "label": None,
+    "confidence": None,
+    "ts": None
+}
+_face_lock = threading.Lock()
+CAMERA_INDEX = 0   # change if needed
 
 
+def safe_load_face_model():
+    """Load your FER model safely."""
+    try:
+        return load_model("face_emotion_model.h5")
+    except Exception as e:
+        logger.error(f"Failed to load face model: {e}")
+        return None
 
 
+def start_face_detection():
+    global latest_face_emotion
 
+    face_model = safe_load_face_model()
+    if face_model is None:
+        logger.warning("Face model not available → skipping face detection thread")
+        return
+
+    labels = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy',
+              4: 'neutral', 5: 'sad', 6: 'surprise'}
+
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    )
+
+    cap = None
+
+    while True:
+        try:
+            # ✅ ensure the camera is open
+            if cap is None or not cap.isOpened():
+                cap = cv2.VideoCapture(CAMERA_INDEX)
+                if not cap.isOpened():
+                    logger.warning("Camera not available. Retrying in 2s...")
+                    time.sleep(2)
+                    continue
+
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning("Could not read frame. Retrying...")
+                time.sleep(0.3)
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.3, minNeighbors=5
+            )
+
+            # ✅ pick largest face only (prevents multi-face confusion)
+            chosen = None
+            max_area = 0
+            for (x, y, w, h) in faces:
+                a = w * h
+                if a > max_area:
+                    max_area = a
+                    chosen = (x, y, w, h)
+
+            if chosen is not None:
+                x, y, w, h = chosen
+                face = gray[y:y + h, x:x + w]
+
+                try:
+                    face = cv2.resize(face, (48, 48))
+                    face = face.astype("float") / 255.0
+                    face = face.reshape(1, 48, 48, 1)
+
+                    pred = face_model.predict(face, verbose=0)[0]
+                    idx = int(np.argmax(pred))
+                    label = labels.get(idx, "neutral")
+                    conf = float(pred[idx])
+
+                    # ✅ Update global shared state
+                    with _face_lock:
+                        latest_face_emotion["label"] = label
+                        latest_face_emotion["confidence"] = round(conf, 3)
+                        latest_face_emotion["ts"] = datetime.utcnow().isoformat() + "Z"
+
+                except Exception as fe:
+                    logger.debug(f"Face preprocess/predict error: {fe}")
+
+            # ✅ CPU protection
+            time.sleep(0.07)
+
+        except Exception as e:
+            logger.exception(f"Face detection thread crashed: {e}")
+            time.sleep(1)
+
+    if cap:
+        cap.release()
+
+
+# ✅ Start face detection automatically
+face_thread = threading.Thread(target=start_face_detection, daemon=True)
+face_thread.start()
+
+
+# ------------------ API ENDPOINT ------------------
+@app.route('/face-emotion', methods=['GET'])
+def get_face_emotion():
+    """Return latest face emotion (label + confidence + timestamp)."""
+    with _face_lock:
+        return jsonify(latest_face_emotion)
+
+    
+
+
+# ------------------------------
+# Run server
+# ------------------------------
 if __name__ == '__main__':
-    print("Starting Speech Emotion Recognition server...")
+    logger.info("Starting merged Speech+Face Emotion server...")
     app.run(debug=True, host='0.0.0.0', port=5000)
