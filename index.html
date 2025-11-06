@@ -680,6 +680,15 @@
             <!-- Analyze Voice Tab -->
             <div id="analyze-tab" class="tab-content active">
                 <h2 class="card-title">Analyze Your Voice</h2>
+                <div id="live-sensors" class="recommendation-box" style="margin-bottom: 15px;">
+                <div class="recommendation-title">Live Sensors</div>
+                <div style="display:flex; gap:15px; flex-wrap:wrap;">
+                <div>Heart Rate: <strong id="sensor-hr">–</strong> bpm</div>
+                 <div>Temperature: <strong id="sensor-temp">–</strong> °C</div>
+                 <div>Light: <strong id="sensor-light">–</strong></div>
+                 <div>Sound: <strong id="sensor-sound">–</strong> dB</div>
+               </div>
+            </div>
                 
                 <div class="tabs">
                     <div class="tab active" onclick="switchAnalysisTab('record')">Record Voice</div>
@@ -944,6 +953,34 @@
     </div>
 
     <script>
+        // cache latest sensors so analyzeRecording/analyzeFile can use them
+let cachedSensors = null;
+
+async function fetchSensors() {
+  try {
+    const res = await fetch('/sensors');
+    const data = await res.json();
+    cachedSensors = data || {};
+
+    // Update UI
+    document.getElementById('sensor-hr').textContent    = (cachedSensors.heart_rate ?? '–');
+    document.getElementById('sensor-temp').textContent  = (cachedSensors.temperature ?? '–');
+    document.getElementById('sensor-light').textContent = (cachedSensors.light === 0 ? 'Dark' :
+                                                           cachedSensors.light === 1 ? 'Light' : '–');
+    document.getElementById('sensor-sound').textContent = (cachedSensors.sound_db ?? '–');
+  } catch (e) {
+    console.warn('fetchSensors failed', e);
+  }
+}
+
+// start polling sensors every 3s
+document.addEventListener('DOMContentLoaded', () => {
+  fetchSensors();
+  setInterval(fetchSensors, 3000);
+});
+        
+        
+
         // DOM Elements
         let startRecordBtn, stopRecordBtn, analyzeRecordBtn, recordStatus;
         let timer, audioPlayer, visualizer, fileInput, fileName, analyzeFileBtn;

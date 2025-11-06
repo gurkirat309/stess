@@ -529,6 +529,9 @@ def analyze():
                 sensor_payload = request.get_json(silent=True) or {}
             except Exception as e:
                 logger.warning(f"Failed to read JSON body: {e}")
+        if not sensor_payload:
+            sensor_payload = load_live_sensors()        
+                
 
         heart_rate  = sensor_payload.get("heart_rate")
         temperature = sensor_payload.get("temperature")
@@ -646,317 +649,35 @@ def analyze():
                 logger.info(f"Cleaned up temporary file: {temp_file_path}")
             except Exception as cleanup_e:
                 logger.error(f"Error cleaning up temporary file: {cleanup_e}")
+# --- Live sensors from JSON file ---
+SENSOR_JSON_PATH = "sensor_data.json"
 
-@app.route('/register', methods=['POST', 'OPTIONS'])
-def register():
-    """Register a new user"""
-    # Handle preflight requests
-    if request.method == 'OPTIONS':
-        return '', 204
-        
+def load_live_sensors():
+    """
+    Reads latest sensor values from a local JSON file.
+    Expected keys: heart_rate, temperature, light (0/1), sound_db
+    Returns {} if file missing or invalid.
+    """
     try:
-        data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')  # In a real app, you'd hash this
-        display_name = data.get('display_name', username)
-        email = data.get('email', '')
-        
-        if not username or not password:
-            return jsonify({'success': False, 'error': 'Username and password are required'})
-        
-        # Check if username already exists
-        conn = sqlite3.connect('emotion_analyzer.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT id FROM users WHERE username = ?', (username,))
-        existing_user = cursor.fetchone()
-        
-        if existing_user:
-            conn.close()
-            return jsonify({'success': False, 'error': 'Username already exists'})
-        
-        # Create new user
-        cursor.execute(
-            'INSERT INTO users (username, password, display_name, email) VALUES (?, ?, ?, ?)',
-            (username, password, display_name, email)
-        )
-        
-        user_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Registered new user: {username} (ID: {user_id})")
-        
-        # Create response with cookie
-        response = jsonify({
-            'success': True, 
-            'user_id': user_id,
-            'username': username,
-            'display_name': display_name
-        })
-        
-        response.set_cookie('user_id', str(user_id), max_age=30*24*60*60)  # 30 days
-        return response
-        
+        with open(SENSOR_JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        # sanitize types
+        out = {}
+        if "heart_rate" in data:  out["heart_rate"]  = float(data["heart_rate"])
+        if "temperature" in data: out["temperature"] = float(data["temperature"])
+        if "light" in data:       out["light"]       = int(data["light"])  # 0/1
+        if "sound_db" in data:    out["sound_db"]    = float(data["sound_db"])
+        return out
     except Exception as e:
-        logger.error(f"Registration error: {e}")
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/login', methods=['POST', 'OPTIONS'])
-def login():
-    """Login a user"""
-    # Handle preflight requests
-    if request.method == 'OPTIONS':
-        return '', 204
-        
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-        
-        if not username or not password:
-            return jsonify({'success': False, 'error': 'Username and password are required'})
-        
-        # Check credentials
-        conn = sqlite3.connect('emotion_analyzer.db')
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, username, display_name, password FROM users WHERE username = ?', (username,))
-        user = cursor.fetchone()
-        conn.close()
-        
-        if not user or user['password'] != password:  # In a real app, compare hashed passwords
-            return jsonify({'success': False, 'error': 'Invalid username or password'})
-        
-        # Create response with cookie
-        response = jsonify({
-            'success': True,
-            'user_id': user['id'],
-            'username': user['username'],
-            'display_name': user['display_name']
-        })
-        
-        response.set_cookie('user_id', str(user['id']), max_age=30*24*60*60)  # 30 days
-        logger.info(f"User logged in: {username} (ID: {user['id']})")
-        return response
-        
-    except Exception as e:
-        logger.error(f"Login error: {e}")
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/logout', methods=['POST', 'OPTIONS'])
-def logout():
-    """Logout a user"""
-    # Handle preflight requests
-    if request.method == 'OPTIONS':
-        return '', 204
-        
-    response = jsonify({'success': True})
-    response.delete_cookie('user_id')
-    return response
-
-@app.route('/user/profile', methods=['GET'])
-def get_profile():
-    """Get user profile information"""
-    user_id = get_user_id_from_request(request)
+        logger.warning(f"load_live_sensors: {e}")
+        return {}
     
-    if not user_id:
-        return jsonify({'success': False, 'error': 'Not logged in'})
-    
-    try:
-        conn = sqlite3.connect('emotion_analyzer.db')
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Get user info
-        cursor.execute('SELECT username, display_name, email, created_at FROM users WHERE id = ?', (user_id,))
-        user = cursor.fetchone()
-        
-        if not user:
-            conn.close()
-            return jsonify({'success': False, 'error': 'User not found'})
-        
-        # Get emotion stats
-        cursor.execute('''
-        SELECT COUNT(*) as total_records,
-               MAX(created_at) as last_record
-        FROM emotion_records 
-        WHERE user_id = ?
-        ''', (user_id,))
-        stats = cursor.fetchone()
-        
-        # Get emotion distribution
-        cursor.execute('''
-        SELECT emotion, COUNT(*) as count
-        FROM emotion_records 
-        WHERE user_id = ?
-        GROUP BY emotion
-        ''', (user_id,))
-        emotion_counts = cursor.fetchall()
-        
-        conn.close()
-        
-        user_dict = dict(user)
-        stats_dict = dict(stats)
-        emotion_distribution = {row['emotion']: row['count'] for row in emotion_counts}
-        
-        return jsonify({
-            'success': True,
-            'profile': user_dict,
-            'stats': stats_dict,
-            'emotion_distribution': emotion_distribution
-        })
-        
-    except Exception as e:
-        logger.error(f"Error getting user profile: {e}")
-        return jsonify({'success': False, 'error': str(e)})
+@app.route('/sensors', methods=['GET'])
+def get_sensors():
+    return jsonify(load_live_sensors())
 
-@app.route('/user/history', methods=['GET'])
-def get_history():
-    """Get user emotion analysis history"""
-    user_id = get_user_id_from_request(request)
-    
-    if not user_id:
-        return jsonify({'success': False, 'error': 'Not logged in'})
-    
-    try:
-        # Get query parameters
-        limit = int(request.args.get('limit', 10))
-        offset = int(request.args.get('offset', 0))
-        
-        conn = sqlite3.connect('emotion_analyzer.db')
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Get records with pagination
-        cursor.execute('''
-        SELECT id, emotion, confidence, stress_level, recommendation, 
-               audio_duration, created_at
-        FROM emotion_records 
-        WHERE user_id = ?
-        ORDER BY created_at DESC
-        LIMIT ? OFFSET ?
-        ''', (user_id, limit, offset))
-        
-        records = [dict(row) for row in cursor.fetchall()]
-        
-        # Get total count
-        cursor.execute('SELECT COUNT(*) as count FROM emotion_records WHERE user_id = ?', (user_id,))
-        total = cursor.fetchone()['count']
-        
-        conn.close()
-        
-        return jsonify({
-            'success': True,
-            'records': records,
-            'total': total,
-            'limit': limit,
-            'offset': offset
-        })
-        
-    except Exception as e:
-        logger.error(f"Error getting history: {e}")
-        return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/user/stats', methods=['GET'])
-def get_stats():
-    """Get user emotion statistics for progress tracking"""
-    user_id = get_user_id_from_request(request)
-    
-    if not user_id:
-        return jsonify({'success': False, 'error': 'Not logged in'})
-    
-    try:
-        # Get time range
-        days = int(request.args.get('days', 30))
-        
-        conn = sqlite3.connect('emotion_analyzer.db')
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Calculate date range
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-        
-        # Get emotion trends over time
-        cursor.execute('''
-        SELECT date(created_at) as date, emotion, COUNT(*) as count
-        FROM emotion_records 
-        WHERE user_id = ? AND created_at >= ?
-        GROUP BY date(created_at), emotion
-        ORDER BY date(created_at)
-        ''', (user_id, start_date.strftime('%Y-%m-%d')))
-        
-        emotion_trends_raw = cursor.fetchall()
-        
-        # Get stress level trends
-        cursor.execute('''
-        SELECT date(created_at) as date, stress_level, COUNT(*) as count
-        FROM emotion_records 
-        WHERE user_id = ? AND created_at >= ?
-        GROUP BY date(created_at), stress_level
-        ORDER BY date(created_at)
-        ''', (user_id, start_date.strftime('%Y-%m-%d')))
-        
-        stress_trends_raw = cursor.fetchall()
-        
-        # Get most common emotions
-        cursor.execute('''
-        SELECT emotion, COUNT(*) as count
-        FROM emotion_records 
-        WHERE user_id = ? AND created_at >= ?
-        GROUP BY emotion
-        ORDER BY count DESC
-        ''', (user_id, start_date.strftime('%Y-%m-%d')))
-        
-        top_emotions = [dict(row) for row in cursor.fetchall()]
-        
-        conn.close()
-        
-        # Format trend data for charts
-        emotion_trends = {}
-        for row in emotion_trends_raw:
-            date = row['date']
-            emotion = row['emotion']
-            count = row['count']
-            
-            if date not in emotion_trends:
-                emotion_trends[date] = {}
-                
-            emotion_trends[date][emotion] = count
-        
-        stress_trends = {}
-        for row in stress_trends_raw:
-            date = row['date']
-            level = row['stress_level']
-            count = row['count']
-            
-            if date not in stress_trends:
-                stress_trends[date] = {}
-                
-            stress_trends[date][level] = count
-        
-        return jsonify({
-            'success': True,
-            'emotion_trends': emotion_trends,
-            'stress_trends': stress_trends,
-            'top_emotions': top_emotions,
-            'days': days
-        })
-        
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'ok',
-        'model_loaded': model is not None,
-        'feature_extractor_loaded': feature_extractor is not None,
-        'emotions_supported': list(id2label.values()) if id2label else []
-    })
 
 if __name__ == '__main__':
     print("Starting Speech Emotion Recognition server...")
