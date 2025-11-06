@@ -686,6 +686,56 @@ def get_sensors():
     return jsonify(load_live_sensors())
 
 
+def compute_wellness_index(sensor):
+    """
+    Compute a 0–100 wellness score based on hardware sensor inputs.
+    Formula is simple & adjustable.
+    """
+
+    heart = sensor.get("heartRate", 0)
+    temp = sensor.get("tempF", 0)
+    light = sensor.get("light", 0)
+    sound = sensor.get("sound", 0)
+
+    score = 100
+
+    # ----- HEART RATE -----
+    if heart > 100:
+        score -= min(30, (heart - 100) * 0.5)
+    elif heart < 50:
+        score -= min(30, (50 - heart) * 0.5)
+
+    # ----- TEMPERATURE -----
+    if temp > 38:
+        score -= min(20, (temp - 38) * 5)
+    elif temp < 35:
+        score -= min(20, (35 - temp) * 5)
+
+    # ----- LIGHT -----
+    if light == 0:
+        score -= 5  # dark environment → mild fatigue
+
+    # ----- SOUND -----
+    if sound > 70:
+        score -= min(20, (sound - 70) * 0.2)
+
+    # Clamp 0–100
+    score = max(0, min(100, score))
+    return round(score, 2)
+
+@app.route('/wellness', methods=['GET'])
+def get_wellness():
+    sensor = load_live_sensors()
+    wellness = compute_wellness_index(sensor)
+
+    return jsonify({
+        "sensors": sensor,
+        "wellness_index": wellness
+    })
+
+
+
+
 
 
 if __name__ == '__main__':
