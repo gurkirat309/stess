@@ -13,6 +13,83 @@ import sqlite3
 from datetime import datetime, timedelta
 import json
 
+# ------------------------------
+# --- Wellness additions (config)
+# ------------------------------
+# Combine risks (tweak later if needed)
+W_AUDIO = 0.5   # emotion-derived stress weight
+W_ENV   = 0.3   # environment (sound/light/temp)
+W_PHYS  = 0.2   # physiology (heart rate)
+
+# Map emotion -> base stress risk [0..1]
+EMOTION_TO_RISK_NUM = {
+    'angry': 0.90,
+    'disgust': 0.80,
+    'fearful': 0.85,
+    'sad': 0.60,
+    'surprised': 0.55,
+    'neutral': 0.45,
+    'happy': 0.25,
+    # 'calm': 0.15,  # only if present in your labels
+}
+
+def ambient_risk_from_json(sound_db=None, light=None, temperature=None):
+    """Heuristic env risk (0..1) from provided sensors.
+       light: 0=dark, 1=light
+    """
+    risks = []
+    # Sound (dB)
+    if sound_db is not None:
+        try:
+            s = float(sound_db)
+            if s < 40:   risks.append(0.2)
+            elif s < 60: risks.append(0.4)
+            elif s < 80: risks.append(0.6)
+            else:        risks.append(0.8)
+        except:  # ignore parse errors
+            pass
+    # Light (binary)
+    if light is not None:
+        try:
+            l = int(light)
+            risks.append(0.7 if l == 0 else 0.3)
+        except:
+            pass
+    # Temperature (°C)
+    if temperature is not None:
+        try:
+            t = float(temperature)
+            if t < 20:   risks.append(0.6)
+            elif t > 30: risks.append(0.7)
+            else:        risks.append(0.4)
+        except:
+            pass
+
+    if not risks:
+        return 0.4
+    return float(np.mean(risks))
+
+def physiological_risk(heart_rate=None):
+    """HR -> stress risk (0..1). Simple bins you can refine later."""
+    if heart_rate is None:
+        return 0.4
+    try:
+        hr = float(heart_rate)
+        if hr < 60:    return 0.3
+        elif hr < 80:  return 0.4
+        elif hr < 100: return 0.6
+        else:          return 0.8
+    except:
+        return 0.4
+
+def recommendation_from_wellness(wellness):
+    if wellness >= 70:
+        return "You’re doing great! Hydrate and maintain good posture."
+    elif wellness >= 40:
+        return "Moderate fatigue/stress. Try 2-min deep breathing or a short walk."
+    else:
+        return "High fatigue/stress detected. Please take a 5-minute break and rest."
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -432,8 +509,62 @@ def analyze():
         # Predict emotion
         result = predict_emotion(temp_file_path)
         logger.info(f"Analysis complete: {result['emotion']} ({result['confidence_str']})")
+
+        # ------------------------------
+        # --- Wellness additions (compute from JSON sensors)
+        # Supported sources:
+        # 1) multipart/form-data field: sensor_json='{"heart_rate":..,"temperature":..,"light":0/1,"sound_db":..}'
+        # 2) raw JSON body (when client posts JSON along with/without audio)
+        # ------------------------------
+        sensor_payload = {}
+        # (a) multipart form field
+        if 'sensor_json' in request.form:
+            try:
+                sensor_payload = json.loads(request.form.get('sensor_json') or "{}")
+            except Exception as e:
+                logger.warning(f"Failed to parse sensor_json field: {e}")
+        # (b) raw JSON body
+        elif request.is_json:
+            try:
+                sensor_payload = request.get_json(silent=True) or {}
+            except Exception as e:
+                logger.warning(f"Failed to read JSON body: {e}")
+
+        heart_rate  = sensor_payload.get("heart_rate")
+        temperature = sensor_payload.get("temperature")
+        light       = sensor_payload.get("light")       # 0 or 1
+        sound_db    = sensor_payload.get("sound_db")    # dB
+
+        # Audio (emotion) risk
+        emo_key = str(result['emotion']).lower().strip()
+        audio_risk = EMOTION_TO_RISK_NUM.get(emo_key, 0.5)
+
+        # Environment + Physiology risks
+        env_risk  = ambient_risk_from_json(sound_db, light, temperature)
+        phys_risk = physiological_risk(heart_rate)
+
+        total_risk = float(np.clip(W_AUDIO*audio_risk + W_ENV*env_risk + W_PHYS*phys_risk, 0.0, 1.0))
+        wellness_index = int(round(100 * (1.0 - total_risk)))
+        wellness_tip = recommendation_from_wellness(wellness_index)
+
+        # Attach to your existing response
+        result.update({
+            "sensors": {
+                "heart_rate": heart_rate,
+                "temperature": temperature,
+                "light": light,
+                "sound_db": sound_db
+            },
+            "audio_risk": round(audio_risk, 3),
+            "env_risk": round(env_risk, 3),
+            "phys_risk": round(phys_risk, 3),
+            "risk": round(total_risk, 3),
+            "wellness_index": wellness_index,
+            "wellness_recommendation": wellness_tip
+        })
+        # --- End wellness additions ---
         
-        # Save record if user is logged in
+        # Save record if user is logged in (unchanged)
         user_id = get_user_id_from_request(request)
         if user_id:
             record_id = save_emotion_record(user_id, result)
@@ -457,6 +588,29 @@ def analyze():
             
             logger.info(f"Using emergency fallback due to error. Emotion: {emotion}")
             
+            # --- Wellness additions even in fallback (safeguard) ---
+            sensor_payload = {}
+            if 'sensor_json' in request.form:
+                try:
+                    sensor_payload = json.loads(request.form.get('sensor_json') or "{}")
+                except:
+                    sensor_payload = {}
+            elif request.is_json:
+                sensor_payload = request.get_json(silent=True) or {}
+
+            heart_rate  = sensor_payload.get("heart_rate")
+            temperature = sensor_payload.get("temperature")
+            light       = sensor_payload.get("light")
+            sound_db    = sensor_payload.get("sound_db")
+
+            audio_risk = EMOTION_TO_RISK_NUM.get(emotion.lower(), 0.5)
+            env_risk  = ambient_risk_from_json(sound_db, light, temperature)
+            phys_risk = physiological_risk(heart_rate)
+            total_risk = float(np.clip(W_AUDIO*audio_risk + W_ENV*env_risk + W_PHYS*phys_risk, 0.0, 1.0))
+            wellness_index = int(round(100 * (1.0 - total_risk)))
+            wellness_tip = recommendation_from_wellness(wellness_index)
+            # --- end wellness additions ---
+
             return jsonify({
                 'emotion': emotion,
                 'confidence': confidence,
@@ -465,7 +619,20 @@ def analyze():
                 'recommendation': recommendation,
                 'all_probabilities': all_probs,
                 'audio_duration': 5.0,
-                'note': 'Using emergency fallback mode due to error'
+                'note': 'Using emergency fallback mode due to error',
+                # wellness extras
+                "sensors": {
+                    "heart_rate": heart_rate,
+                    "temperature": temperature,
+                    "light": light,
+                    "sound_db": sound_db
+                },
+                "audio_risk": round(audio_risk, 3),
+                "env_risk": round(env_risk, 3),
+                "phys_risk": round(phys_risk, 3),
+                "risk": round(total_risk, 3),
+                "wellness_index": wellness_index,
+                "wellness_recommendation": wellness_tip
             })
         except:
             # If even the fallback fails, return error
