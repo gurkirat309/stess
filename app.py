@@ -652,25 +652,34 @@ def analyze():
 # --- Live sensors from JSON file ---
 SENSOR_JSON_PATH = "sensor_data.json"
 
+SENSOR_JSON_PATH = "sensor_data.json"
+
 def load_live_sensors():
     """
-    Reads latest sensor values from a local JSON file.
-    Expected keys: heart_rate, temperature, light (0/1), sound_db
-    Returns {} if file missing or invalid.
+    Reads the LAST line from a JSON-lines file.
+    Example line: {"heartRate": 78, "tempF": 84.0, "light": 1, "sound": 0}
     """
     try:
         with open(SENSOR_JSON_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-        # sanitize types
-        out = {}
-        if "heartRate" in data:  out["heartRate"]  = float(data["heart_rate"])
-        if "tempF" in data: out["tempF"] = float(data["temperature"])
-        if "light" in data:       out["light"]       = int(data["light"])  # 0/1
-        if "sound" in data:    out["sound"]    = float(data["sound_db"])
-        return out
+            lines = f.readlines()
+
+        if not lines:
+            return {}
+
+        last_line = lines[-1].strip()
+        data = json.loads(last_line)
+
+        return {
+            "heart_rate": float(data.get("heartRate", 0)),
+            "temperature": float(data.get("tempF", 0)),
+            "light": int(data.get("light", 0)),
+            "sound_db": float(data.get("sound", 0))
+        }
+
     except Exception as e:
-        logger.warning(f"load_live_sensors: {e}")
+        logger.warning(f"load_live_sensors error: {e}")
         return {}
+
     
 @app.route('/sensors', methods=['GET'])
 def get_sensors():
