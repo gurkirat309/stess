@@ -327,109 +327,120 @@ def safe_load_face_model():
             _cached_face_model = None
             return None
 
-def capture_face_emotion(timeout_seconds=3):
+def capture_face_emotion(timeout_seconds=3, cam_index=None):
     """
-    Open camera briefly, capture one frame, run face detection/prediction.
-    Returns dict: {label, confidence, ts} and updates latest_face_emotion under lock.
-    This function is synchronous and intended to be called on-demand (not in a persistent thread).
+    Open camera briefly, capture a few frames, run robust face detection, predict emotion.
+    Returns dict: {label, confidence, ts, (optional) debug_image} and updates latest_face_emotion.
     """
     face_model = safe_load_face_model()
     if face_model is None:
         return {"label": None, "confidence": 0.0, "ts": None, "error": "face model not available"}
 
-    # try to open camera (use CAP_DSHOW on Windows if needed)
+    idx = CAMERA_INDEX if cam_index is None else int(cam_index)
+
+    # Try default backend, then CAP_DSHOW (Windows)
+    cap = cv2.VideoCapture(idx)
+    if not cap.isOpened():
+        try:
+            cap.release()
+        except:
+            pass
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+
+    if not cap.isOpened():
+        return {"label": None, "confidence": 0.0, "ts": None, "error": "camera not available"}
+
+    # Resolution hint
     try:
-        # Note: on macOS/OpenCV, sometimes CAP_DSHOW isn't available — keep default
-        cap = cv2.VideoCapture(CAMERA_INDEX)
-        start = time.time()
-        if not cap.isOpened():
-            # try fallback backends
-            try:
-                cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-            except Exception:
-                pass
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+    except:
+        pass
 
-        # warm-up for a short time
-        warm_started = time.time()
-        while time.time() - warm_started < 0.3:
-            if cap.isOpened():
-                break
-            time.sleep(0.05)
+    # Warmup
+    t0 = time.time()
+    while time.time() - t0 < 0.5:
+        cap.read()
 
-        if not cap.isOpened():
-            return {"label": None, "confidence": 0.0, "ts": None, "error": "camera not available"}
+    # Read a handful of frames and pick the one with the clearest detection
+    best = None  # (faces, frame, gray_for_best)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-        # set a reasonable resolution
-        try:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        except:
-            pass
+    def preprocess_gray(bgr):
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        # light denoise + contrast boost
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        gray = cv2.equalizeHist(gray)
+        return gray
 
-        # read one good frame within timeout
-        frame = None
-        while time.time() - start < timeout_seconds:
-            ret, f = cap.read()
-            if not ret:
-                time.sleep(0.05)
-                continue
-            frame = f
-            break
+    tries = 0
+    start = time.time()
+    while time.time() - start < timeout_seconds and tries < 12:
+        ok, frame = cap.read()
+        if not ok:
+            tries += 1
+            continue
 
-        cap.release()
+        gray = preprocess_gray(frame)
 
-        if frame is None:
-            return {"label": None, "confidence": 0.0, "ts": None, "error": "no frame captured"}
+        # Try a couple of detector settings
+        candidates = []
+        for params in (
+            dict(scaleFactor=1.1, minNeighbors=4, minSize=(60, 60)),
+            dict(scaleFactor=1.05, minNeighbors=3, minSize=(50, 50)),
+        ):
+            faces = face_cascade.detectMultiScale(gray, **params)
+            if len(faces) > 0:
+                candidates.append((faces, frame, gray))
+                break  # found with this param set
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+        if candidates:
+            # Prefer frame with largest face area
+            faces, fr, gr = candidates[0]
+            if best is None or (len(faces) > 0 and max(f[2]*f[3] for f in faces) >
+                                max(best[0][i][2]*best[0][i][3] for i in range(len(best[0])))):
+                best = (faces, fr, gr)
 
-        if len(faces) == 0:
-            return {"label": None, "confidence": 0.0, "ts": None, "error": "no face detected"}
+        tries += 1
 
-        # pick largest face
-        x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
-        roi = gray[y:y+h, x:x+w]
-        roi = cv2.resize(roi, (48, 48))
-        roi = roi.astype("float") / 255.0
-        roi = roi.reshape(1, 48, 48, 1)
+    cap.release()
 
-        pred = face_model.predict(roi, verbose=0)[0]
-        idx = int(np.argmax(pred))
-        # map to the same labels you used in training
-        labels = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 4: 'neutral', 5: 'sad', 6: 'surprise'}
-        label = labels.get(idx, "neutral")
-        conf = float(pred[idx])
+    if not best:
+        return {"label": None, "confidence": 0.0, "ts": None, "error": "no face detected"}
 
-        out = {"label": label, "confidence": round(conf, 3), "ts": datetime.utcnow().isoformat() + "Z"}
+    faces, frame, gray = best
+    # pick largest
+    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
 
-        # update shared state
-        with _face_lock:
-            latest_face_emotion.update({"label": out["label"], "confidence": out["confidence"], "ts": out["ts"]})
+    # Prepare ROI for model
+    roi = gray[y:y+h, x:x+w]
+    try:
+        roi = cv2.resize(roi, (48, 48), interpolation=cv2.INTER_AREA)
+    except Exception:
+        return {"label": None, "confidence": 0.0, "ts": None, "error": "resize failed"}
+    roi = roi.astype("float32") / 255.0
+    roi = roi.reshape(1, 48, 48, 1)
 
-        return out
+    pred = face_model.predict(roi, verbose=0)[0]
+    idx = int(np.argmax(pred))
+    labels = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 4: 'neutral', 5: 'sad', 6: 'surprise'}
+    label = labels.get(idx, "neutral")
+    conf = float(pred[idx])
 
-    except Exception as e:
-        logger.exception(f"capture_face_emotion error: {e}")
-        try:
-            if 'cap' in locals() and cap and cap.isOpened():
-                cap.release()
-        except:
-            pass
-        return {"label": None, "confidence": 0.0, "ts": None, "error": str(e)}
+    out = {"label": label, "confidence": round(conf, 3), "ts": datetime.utcnow().isoformat() + "Z"}
 
-# ------------------------------
-# Routes for face emotion
-# ------------------------------
+    # Update shared state
+    with _face_lock:
+        latest_face_emotion.update({"label": out["label"], "confidence": out["confidence"], "ts": out["ts"]})
+
+    return out
 @app.route('/capture-face', methods=['GET'])
 def capture_face_route():
-    """
-    Capture one frame from the camera, run face emotion detection, return result.
-    This is safe to call from UI or a client. It does not start a persistent thread.
-    """
-    result = capture_face_emotion()
+    cam_index = request.args.get("index")
+    result = capture_face_emotion(cam_index=cam_index)
     return jsonify(result)
+
 
 @app.route("/api/facial-emotion", methods=["POST"])
 def facial_emotion_api():

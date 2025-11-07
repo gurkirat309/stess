@@ -651,6 +651,9 @@
     </style>
     <!-- Include Chart.js for emotion probability visualization -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- TensorFlow.js for face detection -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+    <script src="https://unpkg.com/@tensorflow-models/blazeface@2.0.5/dist/blazeface.js"></script>
 </head>
 <body>
     <div class="container">
@@ -684,29 +687,77 @@
                  <div>Sound: <strong id="sound">–</strong> dB</div>
                  <div id="face-emotion-box" style="
     margin-top: 20px;
-    padding: 15px;
-    border: 1px solid #444;
-    border-radius: 8px;
-    background: #222;
-    color: white;
+    width: 100%;
+    max-width: 350px;
+    padding: 20px;
+    border: 2px solid var(--primary);
+    border-radius: 12px;
+    background: white;
+    box-shadow: 0 4px 12px rgba(106, 103, 206, 0.2);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 15px;
 ">
-   <div style="margin-top: 20px;">
-    <h3>Facial Emotion Detection</h3>
+    <h3 style="margin: 0; color: var(--primary); font-size: 1.1rem; text-align: center;">Facial Emotion Detection</h3>
 
-    <!-- Camera Preview -->
-    <video id="camera-stream" width="320" height="240" autoplay playsinline style="
-        border-radius: 12px;
-        border: 2px solid #ccc;
-        background: #000;
-    "></video>
-
-    <div id="face-info" style="margin-top: 10px; padding: 10px; background: #f5f5f5; border-radius: 10px;">
-        <p><strong>Emotion:</strong> <span id="face-emotion-label">No Face</span></p>
-        <p><strong>Confidence:</strong> <span id="face-emotion-confidence">--</span></p>
-        <p><strong>Last Update:</strong> <span id="face-emotion-ts">--</span></p>
+    <!-- Camera Preview with Face Detection Overlay -->
+    <div style="position: relative; display: inline-block;">
+        <video id="camera-stream" width="280" height="280" autoplay playsinline style="
+            border-radius: 12px;
+            border: 3px solid var(--primary);
+            background: #000;
+            object-fit: cover;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+            transform: scaleX(-1); /* Mirror for better UX */
+        "></video>
+        <canvas id="face-detection-canvas" width="280" height="280" style="
+            position: absolute;
+            top: 0;
+            left: 0;
+            border-radius: 12px;
+            pointer-events: none;
+            transform: scaleX(-1); /* Mirror to match video */
+        "></canvas>
+        <div id="face-detection-status" style="
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(106, 103, 206, 0.9);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            display: none;
+        ">Face Detected</div>
     </div>
-</div>
 
+    <!-- Real-time Emotion Display Box -->
+    <div id="face-info" style="
+        width: 100%;
+        padding: 15px;
+        background: linear-gradient(135deg, var(--light) 0%, #ffffff 100%);
+        border-radius: 10px;
+        border: 2px solid var(--primary);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        text-align: center;
+    ">
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #e0e0e0;">
+            <strong style="color: var(--dark);">Emotion:</strong>
+            <span id="face-emotion-label" style="font-weight: bold; color: var(--primary); font-size: 1.1rem; text-transform: capitalize;">No Face</span>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #e0e0e0;">
+            <strong style="color: var(--dark);">Confidence:</strong>
+            <span id="face-emotion-confidence" style="font-weight: bold; color: var(--secondary); font-size: 1.1rem;">--</span>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 8px 0;">
+            <strong style="color: var(--dark);">Last Update:</strong>
+            <span id="face-emotion-ts" style="font-weight: normal; color: var(--gray); font-size: 0.9rem;">--</span>
+        </div>
+    </div>
 </div>
 
                  
@@ -1215,7 +1266,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 // Append sensors data if available
                 if (cachedSensors) {
-                    formData.append('sensor_data.json', JSON.stringify(cachedSensors));
+                    formData.append('sensor_json', JSON.stringify(cachedSensors));
                 }
                 
                 console.log("Sending audio for analysis, size:", audioFile.size, "bytes, type:", audioFile.type);
@@ -1279,7 +1330,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 // Append sensors data if available
                 if (cachedSensors) {
-                    formData.append('sensor_data.json', JSON.stringify(cachedSensors));
+                    formData.append('sensor_json', JSON.stringify(cachedSensors));
                 }
                 
                 console.log("Sending uploaded file for analysis:", fileInput.files[0].name);
@@ -2098,47 +2149,349 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
-        function startCamera() {
-    const video = document.getElementById("camera-stream");
+        // Face detection variables
+        let faceDetectionModel = null;
+        let faceDetectionRunning = false;
+        let faceDetectionAnimationFrame = null;
 
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        navigator.mediaDevices.getUserMedia({ video: true })
-            .then(stream => {
-                video.srcObject = stream;
-            })
-            .catch(err => {
-                console.error("Camera access blocked:", err);
-                alert("Camera access denied. Enable webcam permissions.");
-            });
-    } else {
-        alert("Your browser does not support camera access.");
-    }
-}
+        // Initialize face detection model
+        async function initFaceDetection() {
+            try {
+                // Check if blazeface is available
+                if (typeof blazeface === 'undefined') {
+                    console.warn("[Face Detection] BlazeFace library not loaded, trying alternative...");
+                    // Try loading from alternative CDN
+                    await new Promise((resolve, reject) => {
+                        const script = document.createElement('script');
+                        script.src = 'https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@2.0.5';
+                        script.onload = resolve;
+                        script.onerror = reject;
+                        document.head.appendChild(script);
+                    });
+                }
+                
+                console.log("[Face Detection] Loading BlazeFace model...");
+                if (typeof blazeface !== 'undefined') {
+                    faceDetectionModel = await blazeface.load();
+                    console.log("[Face Detection] BlazeFace model loaded successfully");
+                    return true;
+                } else {
+                    throw new Error("BlazeFace not available");
+                }
+            } catch (error) {
+                console.error("[Face Detection] Failed to load BlazeFace model:", error);
+                console.log("[Face Detection] Continuing without browser face detection - backend detection will still work");
+                return false;
+            }
+        }
+
+        // Detect faces and draw squares
+        async function detectFaces() {
+            const video = document.getElementById("camera-stream");
+            const canvas = document.getElementById("face-detection-canvas");
+            const statusEl = document.getElementById("face-detection-status");
+            
+            if (!video || !canvas || !faceDetectionModel || video.readyState !== 4) {
+                return;
+            }
+
+            try {
+                // Detect faces
+                const predictions = await faceDetectionModel.estimateFaces(video, false);
+                
+                const ctx = canvas.getContext("2d");
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                
+                if (predictions.length > 0) {
+                    // Show status
+                    if (statusEl) {
+                        statusEl.style.display = "block";
+                    }
+                    
+                    // Draw squares around detected faces
+                    predictions.forEach(prediction => {
+                        const start = prediction.topLeft;
+                        const end = prediction.bottomRight;
+                        const size = [end[0] - start[0], end[1] - start[1]];
+                        
+                        // Draw square
+                        ctx.strokeStyle = "#6a67ce";
+                        ctx.lineWidth = 3;
+                        ctx.strokeRect(start[0], start[1], size[0], size[1]);
+                        
+                        // Draw corner indicators for better visibility
+                        const cornerSize = 15;
+                        ctx.fillStyle = "#6a67ce";
+                        
+                        // Top-left corner
+                        ctx.fillRect(start[0] - 2, start[1] - 2, cornerSize, 3);
+                        ctx.fillRect(start[0] - 2, start[1] - 2, 3, cornerSize);
+                        
+                        // Top-right corner
+                        ctx.fillRect(end[0] - cornerSize + 2, start[1] - 2, cornerSize, 3);
+                        ctx.fillRect(end[0] - 2, start[1] - 2, 3, cornerSize);
+                        
+                        // Bottom-left corner
+                        ctx.fillRect(start[0] - 2, end[1] - 2, cornerSize, 3);
+                        ctx.fillRect(start[0] - 2, end[1] - cornerSize + 2, 3, cornerSize);
+                        
+                        // Bottom-right corner
+                        ctx.fillRect(end[0] - cornerSize + 2, end[1] - 2, cornerSize, 3);
+                        ctx.fillRect(end[0] - 2, end[1] - cornerSize + 2, 3, cornerSize);
+                    });
+                } else {
+                    // Hide status if no face detected
+                    if (statusEl) {
+                        statusEl.style.display = "none";
+                    }
+                }
+            } catch (error) {
+                console.error("[Face Detection] Detection error:", error);
+            }
+            
+            // Continue detection loop
+            if (faceDetectionRunning) {
+                faceDetectionAnimationFrame = requestAnimationFrame(detectFaces);
+            }
+        }
+
+        // Start face detection loop
+        function startFaceDetection() {
+            if (faceDetectionRunning) {
+                return;
+            }
+            
+            if (!faceDetectionModel) {
+                console.warn("[Face Detection] Model not loaded yet");
+                return;
+            }
+            
+            faceDetectionRunning = true;
+            console.log("[Face Detection] Starting face detection loop");
+            detectFaces();
+        }
+
+        // Stop face detection loop
+        function stopFaceDetection() {
+            faceDetectionRunning = false;
+            if (faceDetectionAnimationFrame) {
+                cancelAnimationFrame(faceDetectionAnimationFrame);
+                faceDetectionAnimationFrame = null;
+            }
+            // Clear canvas
+            const canvas = document.getElementById("face-detection-canvas");
+            if (canvas) {
+                const ctx = canvas.getContext("2d");
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+            }
+            const statusEl = document.getElementById("face-detection-status");
+            if (statusEl) {
+                statusEl.style.display = "none";
+            }
+        }
+
+        function startCamera() {
+            const video = document.getElementById("camera-stream");
+            
+            if (!video) {
+                console.warn("Camera video element not found");
+                return;
+            }
+
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: 640 },
+                        height: { ideal: 640 },
+                        facingMode: "user"
+                    } 
+                })
+                    .then(async stream => {
+                        video.srcObject = stream;
+                        await video.play();
+                        console.log("[Camera] Camera started successfully");
+                        
+                        // Wait for video to be ready, then start face detection
+                        video.addEventListener('loadedmetadata', () => {
+                            console.log("[Camera] Video metadata loaded");
+                            if (faceDetectionModel) {
+                                startFaceDetection();
+                            }
+                        }, { once: true });
+                    })
+                    .catch(err => {
+                        console.error("[Camera] Camera access blocked:", err);
+                        const labelEl = document.getElementById("face-emotion-label");
+                        if (labelEl) {
+                            labelEl.textContent = "Camera access denied";
+                        }
+                    });
+            } else {
+                console.warn("[Camera] Your browser does not support camera access.");
+            }
+        }
 
 function fetchFaceEmotion() {
-    fetch("/face-emotion")  // use /face-emotion for latest emotion
-        .then(res => res.json())
-        .then(data => {
-            document.getElementById("face-emotion-label").textContent =
-                data.label || "No Face";
-
-            document.getElementById("face-emotion-confidence").textContent =
-                data.confidence !== undefined ? data.confidence : "--";
-
-            document.getElementById("face-emotion-ts").textContent =
-                data.ts || "--";
+    const labelEl = document.getElementById("face-emotion-label");
+    const confidenceEl = document.getElementById("face-emotion-confidence");
+    const tsEl = document.getElementById("face-emotion-ts");
+    
+    if (!labelEl || !confidenceEl || !tsEl) {
+        console.warn("Face emotion elements not found, retrying...");
+        return;
+    }
+    
+    fetch("/face-emotion")
+        .then(res => {
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
+            return res.json();
         })
-        .catch(err => console.error("Face emotion fetch error:", err));
+        .then(data => {
+            // Update emotion label
+            if (data.label && data.label !== "null" && data.label !== null && data.label.trim() !== "") {
+                labelEl.textContent = data.label.charAt(0).toUpperCase() + data.label.slice(1);
+                labelEl.style.color = "var(--primary)";
+            } else {
+                labelEl.textContent = "No Face";
+                labelEl.style.color = "var(--gray)";
+            }
+
+            // Update confidence as percentage
+            if (data.confidence !== undefined && data.confidence !== null && data.confidence > 0) {
+                const confidencePercent = (data.confidence * 100).toFixed(1);
+                confidenceEl.textContent = confidencePercent + "%";
+                confidenceEl.style.color = "var(--secondary)";
+            } else {
+                confidenceEl.textContent = "--";
+                confidenceEl.style.color = "var(--gray)";
+            }
+
+            // Update timestamp
+            if (data.ts) {
+                try {
+                    const date = new Date(data.ts);
+                    const now = new Date();
+                    const diffMs = now - date;
+                    const diffSec = Math.floor(diffMs / 1000);
+                    
+                    if (diffSec < 5) {
+                        tsEl.textContent = "Just now";
+                    } else if (diffSec < 60) {
+                        tsEl.textContent = diffSec + "s ago";
+                    } else {
+                        const diffMin = Math.floor(diffSec / 60);
+                        tsEl.textContent = diffMin + "m ago";
+                    }
+                } catch (e) {
+                    tsEl.textContent = data.ts || "--";
+                }
+            } else {
+                tsEl.textContent = "--";
+            }
+        })
+        .catch(err => {
+            console.error("Face emotion fetch error:", err);
+            // Show error state
+            if (labelEl) labelEl.textContent = "Error";
+            if (confidenceEl) confidenceEl.textContent = "--";
+            if (tsEl) tsEl.textContent = "--";
+        });
 }
 
 function triggerBackendFaceScan() {
+    console.log("[Face Detection] Triggering backend face scan...");
     fetch("/capture-face")
-        .catch(err => console.warn("Backend capture error:", err));
+        .then(res => {
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+            }
+            return res.json();
+        })
+        .then(data => {
+            console.log("[Face Detection] Backend response:", data);
+            if (data.error) {
+                console.warn("[Face Detection] Error:", data.error);
+                // Update UI to show error state
+                const labelEl = document.getElementById("face-emotion-label");
+                if (labelEl) {
+                    if (data.error.includes("no face")) {
+                        labelEl.textContent = "No Face Detected";
+                        labelEl.style.color = "var(--gray)";
+                    } else if (data.error.includes("camera")) {
+                        labelEl.textContent = "Camera Error";
+                        labelEl.style.color = "var(--danger)";
+                    } else if (data.error.includes("model")) {
+                        labelEl.textContent = "Model Error";
+                        labelEl.style.color = "var(--danger)";
+                    } else {
+                        labelEl.textContent = "Detection Error";
+                        labelEl.style.color = "var(--danger)";
+                    }
+                }
+            } else if (data.label && data.label !== "null" && data.label !== null) {
+                console.log("[Face Detection] Face captured successfully:", data.label, "confidence:", data.confidence);
+                // Immediately update UI with fresh data
+                fetchFaceEmotion();
+            } else {
+                console.log("[Face Detection] No face detected in response");
+            }
+        })
+        .catch(err => {
+            console.error("[Face Detection] Backend capture error:", err);
+            const labelEl = document.getElementById("face-emotion-label");
+            if (labelEl) {
+                labelEl.textContent = "Connection Error";
+                labelEl.style.color = "var(--danger)";
+            }
+        });
 }
 
-startCamera()
-setInterval(fetchFaceEmotion, 1200);
-setInterval(triggerBackendFaceScan, 1500); 
+// Initialize camera and face detection when DOM is ready
+let faceDetectionInterval = null;
+let faceFetchInterval = null;
+
+async function initializeFaceDetection() {
+    console.log("[Init] Initializing face detection system...");
+    
+    // Initialize browser-based face detection model
+    const modelLoaded = await initFaceDetection();
+    if (!modelLoaded) {
+        console.warn("[Init] Browser face detection model failed to load, continuing with backend only");
+    }
+    
+    // Start camera for preview
+    startCamera();
+    
+    // Wait a bit for camera to initialize, then start detection
+    setTimeout(() => {
+        // Start triggering backend face scans every 2 seconds (backend needs time to process)
+        triggerBackendFaceScan(); // Initial call
+        faceDetectionInterval = setInterval(triggerBackendFaceScan, 2000);
+        
+        // Start fetching face emotion data every 1 second (faster than capture for smooth updates)
+        fetchFaceEmotion(); // Initial call
+        faceFetchInterval = setInterval(fetchFaceEmotion, 1000);
+        
+        console.log("[Init] Face detection initialized - browser detection: " + (modelLoaded ? "active" : "disabled") + ", backend scanning every 2s, fetching every 1s");
+    }, 1000);
+}
+
+// Initialize when DOM is ready
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initializeFaceDetection);
+} else {
+    // DOM is already ready
+    initializeFaceDetection();
+}
+
+// Cleanup on page unload
+window.addEventListener('beforeunload', () => {
+    stopFaceDetection();
+    if (faceDetectionInterval) clearInterval(faceDetectionInterval);
+    if (faceFetchInterval) clearInterval(faceFetchInterval);
+}); 
     </script>
 </body>
 </html>
