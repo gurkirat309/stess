@@ -98,7 +98,6 @@
             box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
             padding: clamp(15px, 5vw, 25px);
             margin-bottom: 30px;
-            overflow: hidden;
         }
         
         .card-title {
@@ -657,7 +656,6 @@
     <div class="container">
         <header>
             <h1>StressBuster AI</h1>
-            <p class="tagline">Powered by Whisper Large V3 Model</p>
             
             <!-- User info (shown when logged in) -->
             <div class="user-header" id="user-header" style="display: none;">
@@ -669,9 +667,6 @@
         <div class="card">
             <div class="tabs">
                 <div class="tab active" onclick="switchTab('analyze')">Analyze Voice</div>
-                <div class="tab" onclick="switchTab('progress')">Progress</div>
-                <div class="tab" onclick="switchTab('history')">History</div>
-                <div class="tab" onclick="switchTab('profile')">Profile</div>
                 <div class="tab" onclick="switchTab('about')">About</div>
             </div>
             
@@ -683,10 +678,10 @@
                 <div id="live-sensors" class="recommendation-box" style="margin-bottom: 15px;">
                 <div class="recommendation-title">Live Sensors</div>
                 <div style="display:flex; gap:15px; flex-wrap:wrap;">
-                <div>Heart Rate: <strong id="sensor-hr">–</strong> bpm</div>
-                 <div>Temperature: <strong id="sensor-temp">–</strong> °C</div>
-                 <div>Light: <strong id="sensor-light">–</strong></div>
-                 <div>Sound: <strong id="sensor-sound">–</strong> dB</div>
+                <div>Heart Rate: <strong id="heartRate">–</strong> bpm</div>
+                 <div>Temperature: <strong id="tempF">–</strong> °C</div>
+                 <div>Light: <strong id="light">–</strong></div>
+                 <div>Sound: <strong id="sound">–</strong> dB</div>
                  <div id="face-emotion-box" style="
     margin-top: 20px;
     padding: 15px;
@@ -788,6 +783,33 @@
                         <div id="stress-result"></div>
                     </div>
                     
+                    <!-- Face Emotion Results (shown if present) -->
+                    <div class="result-item" id="face-emotion-result-item" style="display: none;">
+                        <div class="result-label">Facial Emotion:</div>
+                        <div id="face-emotion-result"></div>
+                    </div>
+                    
+                    <!-- Wellness Data (shown if present) -->
+                    <div id="wellness-results" style="display: none;">
+                        <div class="result-item">
+                            <div class="result-label">Wellness Index:</div>
+                            <div id="wellness-index-result"></div>
+                        </div>
+                        <div class="result-item">
+                            <div class="result-label">Overall Risk:</div>
+                            <div id="risk-result"></div>
+                        </div>
+                        <div class="result-item" style="display: flex; flex-direction: column; gap: 5px;">
+                            <div class="result-label">Risk Breakdown:</div>
+                            <div style="display: flex; flex-direction: column; gap: 5px; margin-left: 0;">
+                                <div>Audio Risk: <span id="audio-risk-result">–</span></div>
+                                <div>Environmental Risk: <span id="env-risk-result">–</span></div>
+                                <div>Physiological Risk: <span id="phys-risk-result">–</span></div>
+                                <div>Facial Emotion Risk: <span id="face-risk-result">–</span></div>
+                            </div>
+                        </div>
+                    </div>
+                    
                     <div class="emotion-chart-container">
                         <canvas id="emotion-chart"></canvas>
                     </div>
@@ -796,154 +818,11 @@
                         <div class="recommendation-title">Recommendation:</div>
                         <div id="recommendation-result"></div>
                     </div>
-                </div>
-            </div>
-            
-            <!-- Progress Tracking Tab -->
-            <div id="progress-tab" class="tab-content">
-                <h2 class="card-title">Your Emotional Journey</h2>
-                
-                <div id="progress-login-required" style="text-align: center; display: none;">
-                    <p>Please log in to track your emotional progress over time.</p>
-                    <button class="btn" onclick="switchTab('profile')">Log In</button>
-                </div>
-                
-                <div id="progress-content" style="display: none;">
-                    <div class="progress-filters">
-                        <button class="filter-btn active" onclick="loadProgressStats(7)">7 Days</button>
-                        <button class="filter-btn" onclick="loadProgressStats(30)">30 Days</button>
-                        <button class="filter-btn" onclick="loadProgressStats(90)">90 Days</button>
-                    </div>
                     
-                    <div class="chart-container">
-                        <canvas id="emotions-trend-chart"></canvas>
-                    </div>
-                    
-                    <div class="chart-container">
-                        <canvas id="stress-trend-chart"></canvas>
-                    </div>
-                    
-                    <h3>Your Most Common Emotions</h3>
-                    <div class="chart-container" style="height: 200px;">
-                        <canvas id="top-emotions-chart"></canvas>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- History Tab -->
-            <div id="history-tab" class="tab-content">
-                <h2 class="card-title">Your Analysis History</h2>
-                
-                <div id="history-login-required" style="text-align: center; display: none;">
-                    <p>Please log in to view your analysis history.</p>
-                    <button class="btn" onclick="switchTab('profile')">Log In</button>
-                </div>
-                
-                <div id="history-content" style="display: none;">
-                    <div class="table-responsive">
-                        <table class="history-table" id="history-table">
-                            <thead>
-                                <tr>
-                                    <th>Date & Time</th>
-                                    <th>Emotion</th>
-                                    <th>Stress</th>
-                                    <th>Confidence</th>
-                                </tr>
-                            </thead>
-                            <tbody id="history-tbody">
-                                <!-- History items will be inserted here -->
-                            </tbody>
-                        </table>
-                    </div>
-                    
-                    <div class="pagination" id="history-pagination">
-                        <!-- Pagination will be inserted here -->
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Profile Tab -->
-            <div id="profile-tab" class="tab-content">
-                <h2 class="card-title">Your Profile</h2>
-                
-                <!-- Login Form (shown when not logged in) -->
-                <div id="login-form" class="auth-form">
-                    <div id="login-error" class="form-error"></div>
-                    
-                    <div class="form-group">
-                        <label for="login-username">Username:</label>
-                        <input type="text" id="login-username" placeholder="Enter your username">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="login-password">Password:</label>
-                        <input type="password" id="login-password" placeholder="Enter your password">
-                    </div>
-                    
-                    <div style="text-align: center;">
-                        <button class="btn" id="login-btn">Login</button>
-                    </div>
-                    
-                    <div class="form-footer">
-                        Don't have an account? <a href="#" onclick="toggleAuthForms()">Register</a>
-                    </div>
-                </div>
-                
-                <!-- Register Form (hidden by default) -->
-                <div id="register-form" class="auth-form" style="display: none;">
-                    <div id="register-error" class="form-error"></div>
-                    
-                    <div class="form-group">
-                        <label for="register-username">Username:</label>
-                        <input type="text" id="register-username" placeholder="Choose a username">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="register-password">Password:</label>
-                        <input type="password" id="register-password" placeholder="Choose a password">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="register-name">Display Name (optional):</label>
-                        <input type="text" id="register-name" placeholder="How should we call you?">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="register-email">Email (optional):</label>
-                        <input type="email" id="register-email" placeholder="Your email address">
-                    </div>
-                    
-                    <div style="text-align: center;">
-                        <button class="btn" id="register-btn">Register</button>
-                    </div>
-                    
-                    <div class="form-footer">
-                        Already have an account? <a href="#" onclick="toggleAuthForms()">Login</a>
-                    </div>
-                </div>
-                
-                <!-- User Profile (shown when logged in) -->
-                <div id="user-profile" style="display: none;">
-                    <div class="profile-section">
-                        <div class="profile-avatar" id="profile-avatar">A</div>
-                        <div class="profile-name" id="profile-name">Anonymous</div>
-                        <div id="profile-email"></div>
-                        <div id="profile-joined"></div>
-                    </div>
-                    
-                    <div class="profile-stats">
-                        <div class="stat-item">
-                            <div class="stat-value" id="total-analyses">0</div>
-                            <div class="stat-label">Total Analyses</div>
-                        </div>
-                        <div class="stat-item">
-                            <div class="stat-value" id="last-analysis">Never</div>
-                            <div class="stat-label">Last Analysis</div>
-                        </div>
-                    </div>
-                    
-                    <div style="text-align: center;">
-                        <button class="btn btn-danger" id="logout-btn">Logout</button>
+                    <!-- Wellness Recommendation (shown if present) -->
+                    <div class="recommendation-box" id="wellness-recommendation-box" style="display: none;">
+                        <div class="recommendation-title">Wellness Recommendation:</div>
+                        <div id="wellness-recommendation-result"></div>
                     </div>
                 </div>
             </div>
@@ -976,7 +855,7 @@
         </div>
 
         <footer>
-            <p>StressBuster AI - Powered by Whisper Large V3</p>
+            <p>StressBuster AI</p>
             <p>Current date: Tuesday, April 15, 2025, 12:24 AM IST</p>
         </footer>
     </div>
@@ -984,19 +863,6 @@
     <script>
         // cache latest sensors so analyzeRecording/analyzeFile can use them
 let cachedSensors = null;
-function fetchFaceEmotion() {
-    fetch('/face-emotion')
-        .then(response => response.json())
-        .then(data => {
-            document.getElementById("face-emotion-label").textContent = data.label || "No Face";
-            document.getElementById("face-emotion-confidence").textContent = data.confidence || "--";
-            document.getElementById("face-emotion-ts").textContent = data.ts || "--";
-        })
-        .catch(err => console.error("Face emotion fetch error:", err));
-}
-
-// Update face emotion every 1 second
-setInterval(fetchFaceEmotion, 1000);
 
 
 async function fetchSensors() {
@@ -1006,11 +872,11 @@ async function fetchSensors() {
     cachedSensors = data || {};
 
     // Update UI
-    document.getElementById('sensor-hr').textContent    = (cachedSensors.heart_rate ?? '–');
-    document.getElementById('sensor-temp').textContent  = (cachedSensors.temperature ?? '–');
-    document.getElementById('sensor-light').textContent = (cachedSensors.light === 0 ? 'Dark' :
+    document.getElementById('heartRate').textContent    = (cachedSensors.heart_rate ?? '–');
+    document.getElementById('tempF').textContent  = (cachedSensors.temperature ?? '–');
+    document.getElementById('light').textContent = (cachedSensors.light === 0 ? 'Dark' :
                                                            cachedSensors.light === 1 ? 'Light' : '–');
-    document.getElementById('sensor-sound').textContent = (cachedSensors.sound_db ?? '–');
+    document.getElementById('sound').textContent = (cachedSensors.sound_db ?? '–');
   } catch (e) {
     console.warn('fetchSensors failed', e);
   }
@@ -1149,27 +1015,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     tab.classList.add('active');
                 }
             });
-            
-            // Special handling for certain tabs
-            if (tabId === 'progress') {
-                if (isLoggedIn()) {
-                    document.getElementById('progress-login-required').style.display = 'none';
-                    document.getElementById('progress-content').style.display = 'block';
-                    loadProgressStats(7); // Default to 7 days
-                } else {
-                    document.getElementById('progress-login-required').style.display = 'block';
-                    document.getElementById('progress-content').style.display = 'none';
-                }
-            } else if (tabId === 'history') {
-                if (isLoggedIn()) {
-                    document.getElementById('history-login-required').style.display = 'none';
-                    document.getElementById('history-content').style.display = 'block';
-                    loadHistoryData(0);
-                } else {
-                    document.getElementById('history-login-required').style.display = 'block';
-                    document.getElementById('history-content').style.display = 'none';
-                }
-            }
         }
         
         // Switch between record and upload tabs
@@ -1368,6 +1213,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Append the file to the FormData object
                 formData.append('audio', audioFile);
                 
+                // Append sensors data if available
+                if (cachedSensors) {
+                    formData.append('sensor_data.json', JSON.stringify(cachedSensors));
+                }
+                
                 console.log("Sending audio for analysis, size:", audioFile.size, "bytes, type:", audioFile.type);
                 
                 // Send to server
@@ -1427,6 +1277,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 const formData = new FormData();
                 formData.append('audio', fileInput.files[0]);
                 
+                // Append sensors data if available
+                if (cachedSensors) {
+                    formData.append('sensor_data.json', JSON.stringify(cachedSensors));
+                }
+                
                 console.log("Sending uploaded file for analysis:", fileInput.files[0].name);
                 
                 const response = await fetch('/analyze', {
@@ -1472,6 +1327,74 @@ document.addEventListener('DOMContentLoaded', () => {
             
             // Display recommendation
             document.getElementById('recommendation-result').textContent = data.recommendation;
+            
+            // Display face emotion data if present
+            if (data.face_emotion) {
+                const faceEmotionItem = document.getElementById('face-emotion-result-item');
+                const faceEmotionResult = document.getElementById('face-emotion-result');
+                
+                if (data.face_emotion.label) {
+                    const faceLabel = capitalizeFirstLetter(data.face_emotion.label);
+                    const faceConfidence = data.face_emotion.confidence !== undefined 
+                        ? `${(data.face_emotion.confidence * 100).toFixed(1)}%` 
+                        : 'N/A';
+                    faceEmotionResult.textContent = `${faceLabel} (${faceConfidence} confidence)`;
+                } else {
+                    faceEmotionResult.textContent = 'No face detected';
+                }
+                faceEmotionItem.style.display = 'flex';
+            } else {
+                document.getElementById('face-emotion-result-item').style.display = 'none';
+            }
+            
+            // Display wellness data if present
+            if (data.wellness_index !== undefined || data.risk !== undefined) {
+                const wellnessResults = document.getElementById('wellness-results');
+                
+                if (data.wellness_index !== undefined) {
+                    const wellnessIndexEl = document.getElementById('wellness-index-result');
+                    wellnessIndexEl.textContent = `${data.wellness_index}/100`;
+                    // Style based on wellness index
+                    wellnessIndexEl.className = '';
+                    if (data.wellness_index >= 70) {
+                        wellnessIndexEl.classList.add('stress-low');
+                    } else if (data.wellness_index >= 40) {
+                        wellnessIndexEl.classList.add('stress-medium');
+                    } else {
+                        wellnessIndexEl.classList.add('stress-high');
+                    }
+                }
+                
+                if (data.risk !== undefined) {
+                    document.getElementById('risk-result').textContent = data.risk.toFixed(3);
+                }
+                
+                // Display risk breakdown if present
+                if (data.audio_risk !== undefined) {
+                    document.getElementById('audio-risk-result').textContent = data.audio_risk.toFixed(3);
+                }
+                if (data.env_risk !== undefined) {
+                    document.getElementById('env-risk-result').textContent = data.env_risk.toFixed(3);
+                }
+                if (data.phys_risk !== undefined) {
+                    document.getElementById('phys-risk-result').textContent = data.phys_risk.toFixed(3);
+                }
+                if (data.face_risk !== undefined) {
+                    document.getElementById('face-risk-result').textContent = data.face_risk.toFixed(3);
+                }
+                
+                wellnessResults.style.display = 'block';
+            } else {
+                document.getElementById('wellness-results').style.display = 'none';
+            }
+            
+            // Display wellness recommendation if present
+            if (data.wellness_recommendation) {
+                document.getElementById('wellness-recommendation-result').textContent = data.wellness_recommendation;
+                document.getElementById('wellness-recommendation-box').style.display = 'block';
+            } else {
+                document.getElementById('wellness-recommendation-box').style.display = 'none';
+            }
             
             // Create/update emotion probability chart
             createEmotionChart(data.all_probabilities);
@@ -2128,12 +2051,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 document.getElementById('login-username').value = '';
                 document.getElementById('login-password').value = '';
                 document.getElementById('login-error').style.display = 'none';
-                
-                // If on user-specific tabs, switch to analyze
-                const currentTab = document.querySelector('.tabs > .tab.active').textContent.toLowerCase();
-                if (currentTab.includes('progress') || currentTab.includes('history') || currentTab.includes('profile')) {
-                    switchTab('analyze');
-                }
             } catch (error) {
                 console.error('Logout error:', error);
             }
