@@ -19,7 +19,8 @@ import time
 import cv2
 from tensorflow.keras.models import model_from_json
 
-from flask import Flask, request, jsonify, render_template, make_response
+from flask import Flask, request, jsonify, render_template, make_response, Response
+from collections import deque
 
 # ------------------------------
 # Logging & Flask init
@@ -56,6 +57,15 @@ FACE_MODEL_WEIGHTS = os.environ.get("FACE_MODEL_WEIGHTS", "emotiondetector.h5")
 # Shared face state (kept up-to-date by capture_face_emotion or /api/facial-emotion posts)
 _face_lock = threading.Lock()
 latest_face_emotion = {"label": None, "confidence": 0.0, "ts": None}
+
+# Temporal smoothing for emotion predictions (store recent predictions)
+_emotion_history = deque(maxlen=5)  # Keep last 5 predictions for smoothing
+_emotion_history_lock = threading.Lock()
+
+# Video feed globals for /video_feed streaming
+_video_cap = None
+_video_cap_lock = threading.Lock()
+_video_running = False
 
 # cached face model (loaded lazily)
 _cached_face_model = None
@@ -327,10 +337,167 @@ def safe_load_face_model():
             _cached_face_model = None
             return None
 
+def _enhanced_preprocess_gray(bgr_frame):
+    """
+    Enhanced preprocessing for better face detection and emotion recognition.
+    Uses CLAHE (Contrast Limited Adaptive Histogram Equalization) and bilateral filtering.
+    """
+    gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+    
+    # Bilateral filter for denoising while preserving edges (better than Gaussian)
+    denoised = cv2.bilateralFilter(gray, d=5, sigmaColor=50, sigmaSpace=50)
+    
+    # CLAHE for adaptive contrast enhancement (better than simple equalizeHist)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+    
+    # Light Gaussian blur to reduce remaining noise
+    enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    
+    return enhanced
+
+def _preprocess_roi_for_model(roi_gray):
+    """
+    Enhanced ROI preprocessing specifically for emotion model.
+    Applies histogram equalization and proper normalization.
+    """
+    # Resize to model input size
+    roi_resized = cv2.resize(roi_gray, (48, 48), interpolation=cv2.INTER_AREA)
+    
+    # Apply histogram equalization for better contrast in ROI
+    roi_eq = cv2.equalizeHist(roi_resized)
+    
+    # Normalize to [0, 1]
+    roi_normalized = roi_eq.astype("float32") / 255.0
+    
+    # Reshape for model: (1, 48, 48, 1)
+    roi_final = roi_normalized.reshape(1, 48, 48, 1)
+    
+    return roi_final
+
+def _assess_frame_quality(gray_frame, face_box):
+    """
+    Assess frame quality for reliable emotion detection.
+    Returns quality score and whether frame is acceptable.
+    """
+    if face_box is None:
+        return 0.0, False
+    
+    x, y, w, h = face_box
+    
+    # Check face size (should be large enough)
+    if w < 60 or h < 60:
+        return 0.0, False
+    
+    # Extract face ROI
+    roi = gray_frame[y:y+h, x:x+w]
+    
+    # Check brightness (avoid too dark or too bright)
+    mean_brightness = np.mean(roi)
+    if mean_brightness < 30 or mean_brightness > 220:
+        return 0.3, False
+    
+    # Check contrast (variance)
+    contrast = np.std(roi)
+    if contrast < 15:
+        return 0.4, False
+    
+    # Check blur (Laplacian variance)
+    laplacian_var = cv2.Laplacian(roi, cv2.CV_64F).var()
+    if laplacian_var < 50:  # Too blurry
+        return 0.5, False
+    
+    # Quality score
+    brightness_score = 1.0 - abs(mean_brightness - 128) / 128
+    contrast_score = min(contrast / 50, 1.0)
+    sharpness_score = min(laplacian_var / 200, 1.0)
+    quality = (brightness_score * 0.3 + contrast_score * 0.3 + sharpness_score * 0.4)
+    
+    return quality, quality > 0.5
+
+def _apply_temporal_smoothing(new_label, new_confidence):
+    """
+    Apply temporal smoothing using exponential moving average.
+    Helps stabilize predictions and reduce flickering.
+    Prevents locking onto "surprised" or other over-predicted emotions.
+    """
+    with _emotion_history_lock:
+        # Add to history
+        _emotion_history.append({
+            'label': new_label,
+            'confidence': new_confidence,
+            'timestamp': time.time()
+        })
+        
+        if len(_emotion_history) < 2:
+            return new_label, new_confidence
+        
+        # Check if a single emotion dominates too much (e.g., surprised)
+        label_counts = {}
+        for pred in _emotion_history:
+            label = pred['label']
+            label_counts[label] = label_counts.get(label, 0) + 1
+        
+        # If one emotion appears in >80% of recent history, check if it's over-predicted
+        total_predictions = len(_emotion_history)
+        for label, count in label_counts.items():
+            if count / total_predictions > 0.8 and label == 'surprise':
+                # Surprised is being over-predicted, reset history to allow new predictions
+                _emotion_history.clear()
+                _emotion_history.append({
+                    'label': new_label,
+                    'confidence': new_confidence,
+                    'timestamp': time.time()
+                })
+                return new_label, new_confidence
+        
+        # Count label frequencies in recent history
+        label_confidences = {}
+        
+        for pred in _emotion_history:
+            label = pred['label']
+            conf = pred['confidence']
+            if label not in label_confidences:
+                label_confidences[label] = []
+            label_confidences[label].append(conf)
+        
+        # Find most frequent label, but require at least 2 occurrences
+        most_frequent_label = max(label_counts.items(), key=lambda x: x[1])[0]
+        
+        # If most frequent is "surprise" but confidence is low, prefer neutral or second most frequent
+        if most_frequent_label == 'surprise':
+            avg_surprise_conf = np.mean(label_confidences.get('surprise', [0]))
+            # If surprise confidence is consistently low, prefer neutral
+            if avg_surprise_conf < 0.5:
+                # Check for neutral or other emotions
+                if 'neutral' in label_counts and label_counts['neutral'] >= 1:
+                    most_frequent_label = 'neutral'
+                elif len(label_counts) > 1:
+                    # Get second most frequent
+                    sorted_labels = sorted(label_counts.items(), key=lambda x: x[1], reverse=True)
+                    if len(sorted_labels) > 1:
+                        most_frequent_label = sorted_labels[1][0]
+        
+        # Average confidence for most frequent label
+        smoothed_confidence = np.mean(label_confidences.get(most_frequent_label, [new_confidence]))
+        
+        # Weight recent predictions more heavily (exponential decay)
+        weights = np.exp(np.linspace(-1, 0, len(_emotion_history)))
+        weights = weights / weights.sum()
+        
+        weighted_conf = 0.0
+        for i, pred in enumerate(_emotion_history):
+            if pred['label'] == most_frequent_label:
+                weighted_conf += weights[i] * pred['confidence']
+        
+        smoothed_confidence = max(smoothed_confidence, weighted_conf)
+        
+        return most_frequent_label, smoothed_confidence
+
 def capture_face_emotion(timeout_seconds=3, cam_index=None):
     """
-    Open camera briefly, capture a few frames, run robust face detection, predict emotion.
-    Returns dict: {label, confidence, ts, (optional) debug_image} and updates latest_face_emotion.
+    Enhanced face emotion capture with improved preprocessing and temporal smoothing.
+    Returns dict: {label, confidence, ts, ...} and updates latest_face_emotion.
     """
     face_model = safe_load_face_model()
     if face_model is None:
@@ -363,72 +530,175 @@ def capture_face_emotion(timeout_seconds=3, cam_index=None):
     while time.time() - t0 < 0.5:
         cap.read()
 
-    # Read a handful of frames and pick the one with the clearest detection
-    best = None  # (faces, frame, gray_for_best)
+    # Read multiple frames and pick the best quality ones
+    best_candidates = []  # Store (faces, frame, gray, quality_score)
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-    def preprocess_gray(bgr):
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        # light denoise + contrast boost
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        gray = cv2.equalizeHist(gray)
-        return gray
+    # Multiple detection parameter sets for robustness
+    detection_params = [
+        {'scaleFactor': 1.1, 'minNeighbors': 5, 'minSize': (70, 70)},
+        {'scaleFactor': 1.05, 'minNeighbors': 4, 'minSize': (50, 50)},
+        {'scaleFactor': 1.2, 'minNeighbors': 6, 'minSize': (80, 80)},
+    ]
 
     tries = 0
     start = time.time()
-    while time.time() - start < timeout_seconds and tries < 12:
+    while time.time() - start < timeout_seconds and tries < 15:
         ok, frame = cap.read()
         if not ok:
             tries += 1
             continue
 
-        gray = preprocess_gray(frame)
+        # Enhanced preprocessing
+        enhanced_gray = _enhanced_preprocess_gray(frame)
 
-        # Try a couple of detector settings
-        candidates = []
-        for params in (
-            dict(scaleFactor=1.1, minNeighbors=4, minSize=(60, 60)),
-            dict(scaleFactor=1.05, minNeighbors=3, minSize=(50, 50)),
-        ):
-            faces = face_cascade.detectMultiScale(gray, **params)
+        # Try multiple detection parameter sets
+        for params in detection_params:
+            faces = face_cascade.detectMultiScale(enhanced_gray, **params)
             if len(faces) > 0:
-                candidates.append((faces, frame, gray))
-                break  # found with this param set
-
-        if candidates:
-            # Prefer frame with largest face area
-            faces, fr, gr = candidates[0]
-            if best is None or (len(faces) > 0 and max(f[2]*f[3] for f in faces) >
-                                max(best[0][i][2]*best[0][i][3] for i in range(len(best[0])))):
-                best = (faces, fr, gr)
+                # Pick largest face
+                x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+                
+                # Assess quality
+                quality_score, is_acceptable = _assess_frame_quality(enhanced_gray, (x, y, w, h))
+                
+                if is_acceptable:
+                    best_candidates.append((faces, frame, enhanced_gray, quality_score))
+                    break  # Found good frame with this param set
 
         tries += 1
 
     cap.release()
 
-    if not best:
+    if not best_candidates:
         return {"label": None, "confidence": 0.0, "ts": None, "error": "no face detected"}
 
-    faces, frame, gray = best
-    # pick largest
-    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
-
-    # Prepare ROI for model
-    roi = gray[y:y+h, x:x+w]
-    try:
-        roi = cv2.resize(roi, (48, 48), interpolation=cv2.INTER_AREA)
-    except Exception:
-        return {"label": None, "confidence": 0.0, "ts": None, "error": "resize failed"}
-    roi = roi.astype("float32") / 255.0
-    roi = roi.reshape(1, 48, 48, 1)
-
-    pred = face_model.predict(roi, verbose=0)[0]
-    idx = int(np.argmax(pred))
+    # Sort by quality score and pick top frames
+    best_candidates.sort(key=lambda x: x[3], reverse=True)
+    
+    # Process top 3 frames and average predictions (if available)
+    predictions = []
     labels = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 4: 'neutral', 5: 'sad', 6: 'surprise'}
-    label = labels.get(idx, "neutral")
-    conf = float(pred[idx])
+    
+    for faces, frame, gray, quality_score in best_candidates[:3]:
+        x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+        
+        # Extract and preprocess ROI
+        roi_gray = gray[y:y+h, x:x+w]
+        try:
+            roi_preprocessed = _preprocess_roi_for_model(roi_gray)
+        except Exception:
+            continue
+        
+        # Predict emotion
+        try:
+            pred = face_model.predict(roi_preprocessed, verbose=0)[0]
+            idx = int(np.argmax(pred))
+            label = labels.get(idx, "neutral")
+            conf = float(pred[idx])
+            
+            # Get all emotion confidences
+            happy_conf = float(pred[3])   # index 3 is happy
+            sad_conf = float(pred[5])      # index 5 is sad
+            surprise_conf = float(pred[6]) # index 6 is surprise
+            neutral_conf = float(pred[4])  # index 4 is neutral
+            
+            # Minimum confidence threshold - if max confidence is too low, default to neutral
+            MIN_CONFIDENCE_THRESHOLD = 0.4
+            if conf < MIN_CONFIDENCE_THRESHOLD:
+                label = 'neutral'
+                conf = neutral_conf if neutral_conf > 0.2 else conf
+            
+            # Special handling for surprised - require higher confidence to accept
+            if label == 'surprise':
+                # Require higher confidence for surprise (0.5) or prefer neutral/happy if close
+                if conf < 0.5:
+                    # If neutral or happy are close, prefer them
+                    if neutral_conf > 0.3 and abs(surprise_conf - neutral_conf) < 0.15:
+                        label = 'neutral'
+                        conf = neutral_conf
+                    elif happy_conf > 0.3 and abs(surprise_conf - happy_conf) < 0.15:
+                        label = 'happy'
+                        conf = happy_conf
+                    else:
+                        # Still low confidence, default to neutral
+                        label = 'neutral'
+                        conf = neutral_conf if neutral_conf > 0.2 else conf
+            
+            # Special handling: if happy and sad are close, prefer happy
+            if abs(happy_conf - sad_conf) < 0.15 and happy_conf > 0.3:
+                label = 'happy'
+                conf = happy_conf
+            
+            # If surprise is predicted but other emotions are close, prefer the other
+            if label == 'surprise' and conf < 0.6:
+                # Check if neutral or happy are within 0.1
+                if neutral_conf > 0.25 and abs(surprise_conf - neutral_conf) < 0.1:
+                    label = 'neutral'
+                    conf = neutral_conf
+                elif happy_conf > 0.25 and abs(surprise_conf - happy_conf) < 0.1:
+                    label = 'happy'
+                    conf = happy_conf
+            
+            predictions.append({'label': label, 'confidence': conf, 'quality': quality_score})
+        except Exception:
+            continue
 
-    out = {"label": label, "confidence": round(conf, 3), "ts": datetime.utcnow().isoformat() + "Z"}
+    if not predictions:
+        return {"label": None, "confidence": 0.0, "ts": None, "error": "prediction failed"}
+
+    # Weight predictions by quality and average
+    total_weight = sum(p['quality'] for p in predictions)
+    if total_weight > 0:
+        weighted_label_counts = {}
+        weighted_confidences = {}
+        
+        for p in predictions:
+            weight = p['quality'] / total_weight
+            label = p['label']
+            conf = p['confidence']
+            
+            weighted_label_counts[label] = weighted_label_counts.get(label, 0) + weight
+            if label not in weighted_confidences:
+                weighted_confidences[label] = []
+            weighted_confidences[label].append(conf * weight)
+        
+        # Get most weighted label
+        final_label = max(weighted_label_counts.items(), key=lambda x: x[1])[0]
+        final_confidence = sum(weighted_confidences.get(final_label, [0]))
+        
+        # Final check: if surprise is selected but confidence is low, prefer neutral
+        if final_label == 'surprise' and final_confidence < 0.5:
+            if 'neutral' in weighted_label_counts:
+                final_label = 'neutral'
+                final_confidence = sum(weighted_confidences.get('neutral', [0]))
+            elif 'happy' in weighted_label_counts:
+                final_label = 'happy'
+                final_confidence = sum(weighted_confidences.get('happy', [0]))
+    else:
+        # Fallback: use most frequent label
+        label_counts = {}
+        for p in predictions:
+            label_counts[p['label']] = label_counts.get(p['label'], 0) + 1
+        final_label = max(label_counts.items(), key=lambda x: x[1])[0]
+        final_confidence = np.mean([p['confidence'] for p in predictions if p['label'] == final_label])
+        
+        # Final check: if surprise, prefer neutral if available
+        if final_label == 'surprise' and final_confidence < 0.5:
+            if 'neutral' in label_counts:
+                final_label = 'neutral'
+                final_confidence = np.mean([p['confidence'] for p in predictions if p['label'] == 'neutral'])
+
+    # Apply temporal smoothing
+    smoothed_label, smoothed_confidence = _apply_temporal_smoothing(final_label, final_confidence)
+    
+    # Final safeguard: if smoothed result is surprise with low confidence, default to neutral
+    if smoothed_label == 'surprise' and smoothed_confidence < 0.5:
+        smoothed_label = 'neutral'
+        smoothed_confidence = max(smoothed_confidence, 0.3)
+
+    out = {"label": smoothed_label, "confidence": round(smoothed_confidence, 3), 
+           "ts": datetime.utcnow().isoformat() + "Z"}
 
     # Update shared state
     with _face_lock:
@@ -474,6 +744,187 @@ def face_emotion_route():
     """
     with _face_lock:
         return jsonify(latest_face_emotion)
+
+@app.route('/video_feed')
+def video_feed():
+    """
+    MJPEG video stream with real-time face emotion detection overlay.
+    Uses enhanced preprocessing and temporal smoothing for stable predictions.
+    """
+    def generate_frames():
+        global _video_cap, _video_running
+        
+        face_model = safe_load_face_model()
+        if face_model is None:
+            # Return error frame
+            error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(error_frame, "Face model not available", (50, 240),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            _, buffer = cv2.imencode('.jpg', error_frame)
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            return
+        
+        idx = CAMERA_INDEX
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        labels = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 4: 'neutral', 5: 'sad', 6: 'surprise'}
+        
+        detection_params = [
+            {'scaleFactor': 1.1, 'minNeighbors': 5, 'minSize': (70, 70)},
+            {'scaleFactor': 1.05, 'minNeighbors': 4, 'minSize': (50, 50)},
+        ]
+        
+        with _video_cap_lock:
+            if _video_cap is None or not _video_running:
+                _video_cap = cv2.VideoCapture(idx)
+                if not _video_cap.isOpened():
+                    try:
+                        _video_cap.release()
+                    except:
+                        pass
+                    _video_cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                
+                if not _video_cap.isOpened():
+                    error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(error_frame, "Camera not available", (50, 240),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    _, buffer = cv2.imencode('.jpg', error_frame)
+                    frame_bytes = buffer.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                    return
+                
+                try:
+                    _video_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    _video_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    _video_cap.set(cv2.CAP_PROP_FPS, 30)
+                except:
+                    pass
+                
+                _video_running = True
+        
+        frame_count = 0
+        while True:
+            with _video_cap_lock:
+                if _video_cap is None or not _video_running:
+                    break
+                ret, frame = _video_cap.read()
+            
+            if not ret:
+                break
+            
+            frame_count += 1
+            
+            # Process every 3rd frame for emotion (reduce computation)
+            if frame_count % 3 == 0:
+                # Enhanced preprocessing
+                enhanced_gray = _enhanced_preprocess_gray(frame)
+                
+                # Detect face
+                face_box = None
+                for params in detection_params:
+                    faces = face_cascade.detectMultiScale(enhanced_gray, **params)
+                    if len(faces) > 0:
+                        face_box = max(faces, key=lambda b: b[2] * b[3])
+                        break
+                
+                # Predict emotion if face detected
+                if face_box is not None:
+                    x, y, w, h = face_box
+                    quality_score, is_acceptable = _assess_frame_quality(enhanced_gray, face_box)
+                    
+                    if is_acceptable:
+                        roi_gray = enhanced_gray[y:y+h, x:x+w]
+                        try:
+                            roi_preprocessed = _preprocess_roi_for_model(roi_gray)
+                            pred = face_model.predict(roi_preprocessed, verbose=0)[0]
+                            idx_pred = int(np.argmax(pred))
+                            label = labels.get(idx_pred, "neutral")
+                            conf = float(pred[idx_pred])
+                            
+                            # Get all emotion confidences
+                            happy_conf = float(pred[3])
+                            sad_conf = float(pred[5])
+                            surprise_conf = float(pred[6])
+                            neutral_conf = float(pred[4])
+                            
+                            # Minimum confidence threshold
+                            MIN_CONFIDENCE_THRESHOLD = 0.4
+                            if conf < MIN_CONFIDENCE_THRESHOLD:
+                                label = 'neutral'
+                                conf = neutral_conf if neutral_conf > 0.2 else conf
+                            
+                            # Special handling for surprised - require higher confidence
+                            if label == 'surprise':
+                                if conf < 0.5:
+                                    if neutral_conf > 0.3 and abs(surprise_conf - neutral_conf) < 0.15:
+                                        label = 'neutral'
+                                        conf = neutral_conf
+                                    elif happy_conf > 0.3 and abs(surprise_conf - happy_conf) < 0.15:
+                                        label = 'happy'
+                                        conf = happy_conf
+                                    else:
+                                        label = 'neutral'
+                                        conf = neutral_conf if neutral_conf > 0.2 else conf
+                            
+                            # Special handling: if happy and sad are close, prefer happy
+                            if abs(happy_conf - sad_conf) < 0.15 and happy_conf > 0.3:
+                                label = 'happy'
+                                conf = happy_conf
+                            
+                            # Apply temporal smoothing
+                            smoothed_label, smoothed_conf = _apply_temporal_smoothing(label, conf)
+                            
+                            # Final safeguard: if smoothed result is surprise with low confidence, default to neutral
+                            if smoothed_label == 'surprise' and smoothed_conf < 0.5:
+                                smoothed_label = 'neutral'
+                                smoothed_conf = max(smoothed_conf, 0.3)
+                            
+                            # Update shared state
+                            with _face_lock:
+                                latest_face_emotion.update({
+                                    "label": smoothed_label,
+                                    "confidence": round(smoothed_conf, 3),
+                                    "ts": datetime.utcnow().isoformat() + "Z"
+                                })
+                            
+                            # Draw overlay
+                            color = (0, 255, 0) if smoothed_conf > 0.5 else (0, 165, 255)
+                            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                            label_text = f"{smoothed_label.upper()}: {smoothed_conf:.2f}"
+                            cv2.putText(frame, label_text, (x, y-10),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        except Exception:
+                            pass
+                    else:
+                        # Draw face box even if quality is low
+                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 165, 255), 2)
+                        cv2.putText(frame, "Low quality", (x, y-10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+                else:
+                    # No face detected
+                    cv2.putText(frame, "No face detected", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Encode frame as JPEG
+            try:
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                frame_bytes = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            except Exception:
+                break
+        
+        # Cleanup
+        with _video_cap_lock:
+            if _video_cap is not None:
+                _video_cap.release()
+                _video_cap = None
+            _video_running = False
+    
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # ------------------------------
 # Wellness helpers
