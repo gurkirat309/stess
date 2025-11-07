@@ -23,11 +23,7 @@ Say goodbye to stress with a simple voice recording and let StressBuster AI guid
 - **Languages**: 
   - HTML (73.6%)
   - Python (26.4%)
-- **Frameworks & Libraries**:
-  - OpenAI Whisper
-  - PyTorch
-  - Transformers
-  - Librosa
+
 - **Tools**:
   - Wandb for experiment tracking
   - Google Drive for model hosting
@@ -78,18 +74,7 @@ Say goodbye to stress with a simple voice recording and let StressBuster AI guid
 
 ---
 
-## 🔧 **Model Details**
-- **Base Model**: [openai/whisper-large-v3](https://huggingface.co/openai/whisper-large-v3)
-- **Training Parameters**:
-  - Learning Rate: `5e-05`
-  - Batch Size: `2`
-  - Epochs: `25`
-  - Optimizer: **Adam**
-  - Mixed Precision Training: **Native AMP**
-- **Performance Metrics**:
-  - Accuracy: **91.99%**
-  - F1 Score: **91.98%**
-- **Model Download**: [model.safetensors](https://drive.google.com/file/d/1N1XNpJG4uT1CJgoPtf5SByKRyxn14BAJ/view?usp=sharing)
+#
 
 ---
 
@@ -120,13 +105,11 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ---
 
-## 🌐 **Connect with Us**
-- 🌟 Star the repo to show your support!
-- 🐛 Report issues [here](https://github.com/Ritik650/StressBuster-AI/issues).
-- 📧 Contact us via [ry9812262@gmail.com.com](mailto:ry9812262@gmail.com).
+
 
 **Transform Stress into Strength with StressBuster AI!** 🙌  
 
 ---
 
 Would you like me to assist you with committing this new README file or making additional edits?
+
