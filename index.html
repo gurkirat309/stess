@@ -695,10 +695,23 @@
     background: #222;
     color: white;
 ">
-    <h3>Facial Emotion</h3>
-    <p><strong>Emotion:</strong> <span id="face-emotion-label">Loading...</span></p>
-    <p><strong>Confidence:</strong> <span id="face-emotion-confidence">--</span></p>
-    <p><strong>Timestamp:</strong> <span id="face-emotion-ts">--</span></p>
+   <div style="margin-top: 20px;">
+    <h3>Facial Emotion Detection</h3>
+
+    <!-- Camera Preview -->
+    <video id="camera-stream" width="320" height="240" autoplay playsinline style="
+        border-radius: 12px;
+        border: 2px solid #ccc;
+        background: #000;
+    "></video>
+
+    <div id="face-info" style="margin-top: 10px; padding: 10px; background: #f5f5f5; border-radius: 10px;">
+        <p><strong>Emotion:</strong> <span id="face-emotion-label">No Face</span></p>
+        <p><strong>Confidence:</strong> <span id="face-emotion-confidence">--</span></p>
+        <p><strong>Last Update:</strong> <span id="face-emotion-ts">--</span></p>
+    </div>
+</div>
+
 </div>
 
                  
@@ -2167,6 +2180,48 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (startRecordBtn) startRecordBtn.disabled = true;
             }
         }
+
+        function startCamera() {
+    const video = document.getElementById("camera-stream");
+
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        navigator.mediaDevices.getUserMedia({ video: true })
+            .then(stream => {
+                video.srcObject = stream;
+            })
+            .catch(err => {
+                console.error("Camera access blocked:", err);
+                alert("Camera access denied. Enable webcam permissions.");
+            });
+    } else {
+        alert("Your browser does not support camera access.");
+    }
+}
+
+function fetchFaceEmotion() {
+    fetch("/face-emotion")  // use /face-emotion for latest emotion
+        .then(res => res.json())
+        .then(data => {
+            document.getElementById("face-emotion-label").textContent =
+                data.label || "No Face";
+
+            document.getElementById("face-emotion-confidence").textContent =
+                data.confidence !== undefined ? data.confidence : "--";
+
+            document.getElementById("face-emotion-ts").textContent =
+                data.ts || "--";
+        })
+        .catch(err => console.error("Face emotion fetch error:", err));
+}
+
+function triggerBackendFaceScan() {
+    fetch("/capture-face")
+        .catch(err => console.warn("Backend capture error:", err));
+}
+
+startCamera()
+setInterval(fetchFaceEmotion, 1200);
+setInterval(triggerBackendFaceScan, 1500); 
     </script>
 </body>
 </html>
